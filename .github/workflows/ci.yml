@@ -7,6 +7,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# Default: restrict all jobs to read-only unless overridden per-job
+permissions:
+  contents: read
+
 jobs:
   # ---------------------------------------------------------------------------
   # Build and test on Linux (primary)
@@ -14,6 +18,8 @@ jobs:
   build-linux:
     name: Linux (${{ matrix.build_type }}, ${{ matrix.compiler }})
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -66,6 +72,8 @@ jobs:
   sanitizers:
     name: Sanitizers (ASAN + UBSAN)
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     env:
       CC:  clang-18
       CXX: clang++-18
@@ -108,6 +116,8 @@ jobs:
   tsan:
     name: ThreadSanitizer
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     env:
       CC:  clang-18
       CXX: clang++-18
@@ -148,6 +158,8 @@ jobs:
   build-macos:
     name: macOS (AppleClang)
     runs-on: macos-14
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -178,6 +190,8 @@ jobs:
   build-windows:
     name: Windows (MSVC)
     runs-on: windows-2022
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
