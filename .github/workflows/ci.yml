@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "copilot/**" ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build and test on Linux (primary)
+  # ---------------------------------------------------------------------------
+  build-linux:
+    name: Linux (${{ matrix.build_type }}, ${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+        compiler: [gcc, clang]
+    env:
+      CC:  ${{ matrix.compiler == 'clang' && 'clang-18' || 'gcc-13' }}
+      CXX: ${{ matrix.compiler == 'clang' && 'clang++-18' || 'g++-13' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build \
+            gcc-13 g++-13 \
+            clang-18 \
+            libssl-dev
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER=${{ env.CC }} \
+            -DCMAKE_CXX_COMPILER=${{ env.CXX }} \
+            -DFIX_BUILD_TESTS=ON \
+            -DFIX_BUILD_APPS=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure --timeout 60 -j$(nproc)
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-linux-${{ matrix.build_type }}-${{ matrix.compiler }}
+          path: build/Testing/
+
+  # ---------------------------------------------------------------------------
+  # AddressSanitizer + UBSanitizer
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: Sanitizers (ASAN + UBSAN)
+    runs-on: ubuntu-24.04
+    env:
+      CC:  clang-18
+      CXX: clang++-18
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18
+
+      - name: Configure with sanitizers
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DFIX_BUILD_TESTS=ON \
+            -DFIX_BUILD_APPS=OFF \
+            -DFIX_ENABLE_ASAN=ON \
+            -DFIX_ENABLE_UBSAN=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run tests with sanitizers
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --output-on-failure --timeout 120 -j$(nproc)
+
+  # ---------------------------------------------------------------------------
+  # ThreadSanitizer
+  # ---------------------------------------------------------------------------
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-24.04
+    env:
+      CC:  clang-18
+      CXX: clang++-18
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18
+
+      - name: Configure with TSAN
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DFIX_BUILD_TESTS=ON \
+            -DFIX_BUILD_APPS=OFF \
+            -DFIX_ENABLE_TSAN=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run tests with TSAN
+        working-directory: build
+        env:
+          TSAN_OPTIONS: second_deadlock_stack=1:halt_on_error=1
+        run: ctest --output-on-failure --timeout 120 -j$(nproc)
+
+  # ---------------------------------------------------------------------------
+  # macOS build
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: macOS (AppleClang)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install cmake ninja
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFIX_BUILD_TESTS=ON \
+            -DFIX_BUILD_APPS=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure --timeout 60
+
+  # ---------------------------------------------------------------------------
+  # Windows build (MSVC)
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Windows (MSVC)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DFIX_BUILD_TESTS=ON `
+            -DFIX_BUILD_APPS=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run tests
+        working-directory: build
+        run: ctest -C Release --output-on-failure --timeout 60

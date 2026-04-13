@@ -39,3 +39,27 @@
 
 # debug information files
 *.dwo
+
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# vcpkg
+vcpkg_installed/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Runtime artifacts
+fix_store/
+fix_logs/
+oms_store/
+oms_logs/
+
+# Compile commands
+compile_commands.json
