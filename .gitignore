@@ -63,3 +63,6 @@ oms_logs/
 
 # Compile commands
 compile_commands.json
+
+# clangd
+.cache

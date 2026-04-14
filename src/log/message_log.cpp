@@ -84,7 +84,7 @@ void FileAuditLog::write_entry(const AuditEntry &e) {
 #else
     gmtime_r(&tt, &tmv);
 #endif
-    char ts[32];
+    char ts[64];
     std::snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", tmv.tm_year + 1900,
                   tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
                   (int)ms.count());
