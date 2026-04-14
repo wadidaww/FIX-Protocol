@@ -89,7 +89,9 @@ protected:
     SessionID sid;
 
     void SetUp() override {
-        tmpdir = std::filesystem::temp_directory_path() / "fix_filestore_test";
+        auto *test_info = testing::UnitTest::GetInstance()->current_test_info();
+        tmpdir = std::filesystem::temp_directory_path() /
+                 (std::string("fix_filestore_") + test_info->name());
         std::filesystem::create_directories(tmpdir);
         sid.senderCompID = "SENDER";
         sid.targetCompID = "TARGET";

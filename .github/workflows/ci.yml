@@ -43,8 +43,8 @@ jobs:
         build_type: [Release, Debug]
         compiler: [gcc, clang]
     env:
-      CC:  ${{ matrix.compiler == 'clang' && 'clang-18' || 'gcc-13' }}
-      CXX: ${{ matrix.compiler == 'clang' && 'clang++-18' || 'g++-13' }}
+      CC:  ${{ matrix.compiler == 'clang' && 'clang-19' || 'gcc-14' }}
+      CXX: ${{ matrix.compiler == 'clang' && 'clang++-19' || 'g++-14' }}
 
     steps:
       - name: Checkout
@@ -55,8 +55,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build \
-            gcc-13 g++-13 \
-            clang-18 \
+            gcc-14 g++-14 \
+            clang-19 \
             libssl-dev
 
       - name: Configure CMake
@@ -92,8 +92,8 @@ jobs:
     permissions:
       contents: read
     env:
-      CC:  clang-18
-      CXX: clang++-18
+      CC:  clang-19
+      CXX: clang++-19
 
     steps:
       - name: Checkout
@@ -103,15 +103,15 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang-18
+            cmake ninja-build clang-19 g++-14
 
       - name: Configure with sanitizers
         run: |
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_COMPILER=clang-18 \
-            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_C_COMPILER=clang-19 \
+            -DCMAKE_CXX_COMPILER=clang++-19 \
             -DFIX_BUILD_TESTS=ON \
             -DFIX_BUILD_APPS=OFF \
             -DFIX_ENABLE_ASAN=ON \
@@ -136,8 +136,8 @@ jobs:
     permissions:
       contents: read
     env:
-      CC:  clang-18
-      CXX: clang++-18
+      CC:  clang-19
+      CXX: clang++-19
 
     steps:
       - name: Checkout
@@ -147,15 +147,15 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang-18
+            cmake ninja-build clang-19 g++-14
 
       - name: Configure with TSAN
         run: |
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_COMPILER=clang-18 \
-            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_C_COMPILER=clang-19 \
+            -DCMAKE_CXX_COMPILER=clang++-19 \
             -DFIX_BUILD_TESTS=ON \
             -DFIX_BUILD_APPS=OFF \
             -DFIX_ENABLE_TSAN=ON
