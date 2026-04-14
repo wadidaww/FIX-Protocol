@@ -1,0 +1,87 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# Column limit
+ColumnLimit: 100
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+ConstructorInitializerIndentWidth: 4
+AccessModifierOffset: -4
+
+# Brace style
+BreakBeforeBraces: Attach
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+
+# Includes
+SortIncludes: CaseInsensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  # Project headers first
+  - Regex:           '^"fix/'
+    Priority:        1
+  # Standard library
+  - Regex:           '^<[a-z_]+>$'
+    Priority:        2
+  # Everything else (third-party, OS)
+  - Regex:           '.*'
+    Priority:        3
+
+# Spacing
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInParentheses: false
+SpacesInAngles: false
+SpacesInContainerLiterals: false
+SpaceAfterCStyleCast: false
+SpaceAroundPointerQualifiers: Default
+
+# Pointers and references: align to variable name
+PointerAlignment: Right
+
+# Alignment
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 0
+
+# Line breaking
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+AllowShortEnumsOnASingleLine: false
+AllowShortLambdasOnASingleLine: Inline
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializers: BeforeColon
+PackConstructorInitializers: Never
+
+# Template
+AlwaysBreakTemplateDeclarations: Yes
+
+# Namespace
+NamespaceIndentation: None
+CompactNamespaces: false
+FixNamespaceComments: true
+
+# Comments
+ReflowComments: false
+
+# C++
+Standard: Latest
+Cpp11BracedListStyle: true
+...
