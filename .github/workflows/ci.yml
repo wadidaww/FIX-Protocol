@@ -92,8 +92,8 @@ jobs:
     permissions:
       contents: read
     env:
-      CC:  clang-19
-      CXX: clang++-19
+      CC:  gcc-14
+      CXX: g++-14
 
     steps:
       - name: Checkout
@@ -103,15 +103,15 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang-19 g++-14
+            cmake ninja-build gcc-14 g++-14
 
       - name: Configure with sanitizers
         run: |
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_COMPILER=clang-19 \
-            -DCMAKE_CXX_COMPILER=clang++-19 \
+            -DCMAKE_C_COMPILER=gcc-14 \
+            -DCMAKE_CXX_COMPILER=g++-14 \
             -DFIX_BUILD_TESTS=ON \
             -DFIX_BUILD_APPS=OFF \
             -DFIX_ENABLE_ASAN=ON \
@@ -136,8 +136,8 @@ jobs:
     permissions:
       contents: read
     env:
-      CC:  clang-19
-      CXX: clang++-19
+      CC:  gcc-14
+      CXX: g++-14
 
     steps:
       - name: Checkout
@@ -147,15 +147,15 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang-19 g++-14
+            cmake ninja-build gcc-14 g++-14
 
       - name: Configure with TSAN
         run: |
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_COMPILER=clang-19 \
-            -DCMAKE_CXX_COMPILER=clang++-19 \
+            -DCMAKE_C_COMPILER=gcc-14 \
+            -DCMAKE_CXX_COMPILER=g++-14 \
             -DFIX_BUILD_TESTS=ON \
             -DFIX_BUILD_APPS=OFF \
             -DFIX_ENABLE_TSAN=ON

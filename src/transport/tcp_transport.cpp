@@ -53,7 +53,9 @@ void TcpTransport::stop() {
     }
 #endif
     if (listen_fd_ >= 0) {
+#ifndef _WIN32
         ::close(listen_fd_);
+#endif
         listen_fd_ = -1;
     }
     if (io_thread_.joinable())
