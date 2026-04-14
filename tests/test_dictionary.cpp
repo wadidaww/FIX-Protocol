@@ -1,10 +1,11 @@
 // =============================================================================
 // FIX Protocol Engine - Dictionary unit tests
 // =============================================================================
-#include <gtest/gtest.h>
-#include "fix/dictionary/data_dictionary.hpp"
 #include "fix/core/constants.hpp"
 #include "fix/core/message.hpp"
+#include "fix/dictionary/data_dictionary.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace fix;
 
@@ -20,7 +21,7 @@ TEST(DictionaryTest, FindFieldByTag) {
     DataDictionary d;
     d.load_builtin(FixVersion::FIX_4_4);
 
-    auto* f = d.find_field(tags::Symbol);
+    auto *f = d.find_field(tags::Symbol);
     ASSERT_NE(f, nullptr);
     EXPECT_EQ(f->tag, tags::Symbol);
     EXPECT_EQ(f->name, "Symbol");
@@ -30,7 +31,7 @@ TEST(DictionaryTest, FindFieldByName) {
     DataDictionary d;
     d.load_builtin(FixVersion::FIX_4_4);
 
-    auto* f = d.find_field("Symbol");
+    auto *f = d.find_field("Symbol");
     ASSERT_NE(f, nullptr);
     EXPECT_EQ(f->tag, tags::Symbol);
 }
@@ -46,7 +47,7 @@ TEST(DictionaryTest, FindMessageType) {
     DataDictionary d;
     d.load_builtin(FixVersion::FIX_4_4);
 
-    auto* m = d.find_message("D");
+    auto *m = d.find_message("D");
     ASSERT_NE(m, nullptr);
     EXPECT_EQ(m->name, "NewOrderSingle");
     EXPECT_FALSE(m->is_admin);
@@ -56,7 +57,7 @@ TEST(DictionaryTest, FindAdminMessage) {
     DataDictionary d;
     d.load_builtin(FixVersion::FIX_4_4);
 
-    auto* m = d.find_message("A");
+    auto *m = d.find_message("A");
     ASSERT_NE(m, nullptr);
     EXPECT_EQ(m->name, "Logon");
     EXPECT_TRUE(m->is_admin);
@@ -103,12 +104,12 @@ TEST(DictionaryTest, CustomFieldRegistration) {
     d.load_builtin(FixVersion::FIX_4_4);
 
     FieldDef custom;
-    custom.tag  = 9999;
+    custom.tag = 9999;
     custom.name = "MyCustomField";
     custom.type = FieldType::String;
     d.register_field(std::move(custom));
 
-    auto* f = d.find_field(9999);
+    auto *f = d.find_field(9999);
     ASSERT_NE(f, nullptr);
     EXPECT_EQ(f->name, "MyCustomField");
 }
@@ -136,7 +137,7 @@ TEST(DictionaryTest, RegistryGetAndSet) {
 
     DictionaryRegistry::instance().set(FixVersion::FIX_5_0SP2, dict);
 
-    const auto* d = DictionaryRegistry::instance().get(FixVersion::FIX_5_0SP2);
+    const auto *d = DictionaryRegistry::instance().get(FixVersion::FIX_5_0SP2);
     ASSERT_NE(d, nullptr);
     EXPECT_EQ(d->version(), FixVersion::FIX_5_0SP2);
 }

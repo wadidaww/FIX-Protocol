@@ -1,41 +1,42 @@
 // =============================================================================
 // FIX Protocol Engine - Session unit tests
 // =============================================================================
-#include <gtest/gtest.h>
+#include "fix/core/constants.hpp"
+#include "fix/parser/serializer.hpp"
 #include "fix/session/session.hpp"
 #include "fix/store/memory_store.hpp"
-#include "fix/parser/serializer.hpp"
-#include "fix/core/constants.hpp"
-#include <vector>
+
 #include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
 
 using namespace fix;
 
 // ---------------------------------------------------------------------------
 // Helper: build a wire FIX message
 // ---------------------------------------------------------------------------
-static std::string make_wire(std::string_view begin_str,
-                               std::string_view msg_type,
-                               SeqNum seq,
-                               std::string_view sender,
-                               std::string_view target,
-                               std::initializer_list<std::pair<TagNum, std::string_view>> extra = {}) {
+static std::string
+make_wire(std::string_view begin_str, std::string_view msg_type, SeqNum seq,
+          std::string_view sender, std::string_view target,
+          std::initializer_list<std::pair<TagNum, std::string_view>> extra = {}) {
     MessageBuilder b;
     b.begin(begin_str, msg_type);
     b.add(tags::SenderCompID, sender);
     b.add(tags::TargetCompID, target);
     b.add(tags::MsgSeqNum, static_cast<std::int64_t>(seq));
     b.add(tags::SendingTime, "20240101-12:00:00.000");
-    for (auto& [tag, val] : extra) b.add(tag, val);
+    for (auto &[tag, val] : extra)
+        b.add(tag, val);
     return b.finish();
 }
 
 static SessionConfig make_cfg(bool initiator = false) {
     SessionConfig cfg;
-    cfg.id.version       = FixVersion::FIX_4_2;
-    cfg.id.senderCompID  = "SERVER";
-    cfg.id.targetCompID  = "CLIENT";
-    cfg.initiator        = initiator;
+    cfg.id.version = FixVersion::FIX_4_2;
+    cfg.id.senderCompID = "SERVER";
+    cfg.id.targetCompID = "CLIENT";
+    cfg.initiator = initiator;
     cfg.heartbeat_interval = 30;
     return cfg;
 }
@@ -46,7 +47,9 @@ static SessionConfig make_cfg(bool initiator = false) {
 TEST(SessionTest, InitialStateNotConnected) {
     std::vector<std::string> sent;
     SessionCallbacks cbs;
-    cbs.do_send = [&](const std::string& s){ sent.push_back(s); };
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
 
     auto store = std::make_unique<MemoryStore>();
     Session s(make_cfg(false), std::move(store), nullptr, cbs);
@@ -58,8 +61,12 @@ TEST(SessionTest, AcceptorReceivesLogon_TransitionsToActive) {
     bool logon_called = false;
 
     SessionCallbacks cbs;
-    cbs.do_send  = [&](const std::string& s){ sent.push_back(s); };
-    cbs.on_logon = [&](const SessionID&){ logon_called = true; };
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.on_logon = [&](const SessionID &) {
+        logon_called = true;
+    };
 
     auto store = std::make_unique<MemoryStore>();
     Session sess(make_cfg(false), std::move(store), nullptr, cbs);
@@ -70,7 +77,7 @@ TEST(SessionTest, AcceptorReceivesLogon_TransitionsToActive) {
 
     // Now feed a Logon message from the counterparty
     std::string wire = make_wire("FIX.4.2", msg_types::Logon, 1, "CLIENT", "SERVER",
-        {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
+                                 {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
     sess.on_data(wire.data(), wire.size());
 
     EXPECT_EQ(sess.state(), SessionState::Active);
@@ -81,7 +88,9 @@ TEST(SessionTest, AcceptorReceivesLogon_TransitionsToActive) {
 TEST(SessionTest, InitiatorLogon_SetsLogonSentState) {
     std::vector<std::string> sent;
     SessionCallbacks cbs;
-    cbs.do_send = [&](const std::string& s){ sent.push_back(s); };
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
 
     auto store = std::make_unique<MemoryStore>();
     Session sess(make_cfg(true), std::move(store), nullptr, cbs);
@@ -103,8 +112,12 @@ TEST(SessionTest, HeartbeatSent) {
     bool logon_called = false;
 
     SessionCallbacks cbs;
-    cbs.do_send  = [&](const std::string& s){ sent.push_back(s); };
-    cbs.on_logon = [&](const SessionID&){ logon_called = true; };
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.on_logon = [&](const SessionID &) {
+        logon_called = true;
+    };
 
     auto store = std::make_unique<MemoryStore>();
     Session sess(make_cfg(false), std::move(store), nullptr, cbs);
@@ -112,7 +125,7 @@ TEST(SessionTest, HeartbeatSent) {
 
     // Feed a logon
     std::string logon = make_wire("FIX.4.2", msg_types::Logon, 1, "CLIENT", "SERVER",
-        {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
+                                  {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
     sess.on_data(logon.data(), logon.size());
     ASSERT_EQ(sess.state(), SessionState::Active);
 
@@ -135,25 +148,28 @@ TEST(SessionTest, HeartbeatSent) {
 TEST(SessionTest, TestRequestAndResponse) {
     std::vector<std::string> sent;
     SessionCallbacks cbs;
-    cbs.do_send  = [&](const std::string& s){ sent.push_back(s); };
-    cbs.on_logon = [&](const SessionID&){};
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.on_logon = [&](const SessionID &) {
+    };
 
     auto store = std::make_unique<MemoryStore>();
     Session sess(make_cfg(false), std::move(store), nullptr, cbs);
     sess.logon();
 
     std::string logon = make_wire("FIX.4.2", msg_types::Logon, 1, "CLIENT", "SERVER",
-        {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
+                                  {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
     sess.on_data(logon.data(), logon.size());
 
     // Feed a TestRequest from counterparty
     std::string tr = make_wire("FIX.4.2", msg_types::TestRequest, 2, "CLIENT", "SERVER",
-        {{tags::TestReqID, "PING1"}});
+                               {{tags::TestReqID, "PING1"}});
     sess.on_data(tr.data(), tr.size());
 
     // Session should have sent a Heartbeat with TestReqID=PING1
     bool found = false;
-    for (const auto& s : sent) {
+    for (const auto &s : sent) {
         StreamParser p;
         p.feed(s.data(), s.size());
         Message m;
@@ -172,21 +188,26 @@ TEST(SessionTest, LogoutFlow) {
     bool logout_called = false;
 
     SessionCallbacks cbs;
-    cbs.do_send   = [&](const std::string& s){ sent.push_back(s); };
-    cbs.on_logon  = [&](const SessionID&){};
-    cbs.on_logout = [&](const SessionID&, std::string_view){ logout_called = true; };
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.on_logon = [&](const SessionID &) {
+    };
+    cbs.on_logout = [&](const SessionID &, std::string_view) {
+        logout_called = true;
+    };
 
     auto store = std::make_unique<MemoryStore>();
     Session sess(make_cfg(false), std::move(store), nullptr, cbs);
     sess.logon();
 
     std::string logon = make_wire("FIX.4.2", msg_types::Logon, 1, "CLIENT", "SERVER",
-        {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
+                                  {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
     sess.on_data(logon.data(), logon.size());
 
     // Feed a Logout from counterparty
-    std::string lo = make_wire("FIX.4.2", msg_types::Logout, 2, "CLIENT", "SERVER",
-        {{tags::Text, "Goodbye"}});
+    std::string lo =
+        make_wire("FIX.4.2", msg_types::Logout, 2, "CLIENT", "SERVER", {{tags::Text, "Goodbye"}});
     sess.on_data(lo.data(), lo.size());
 
     EXPECT_TRUE(logout_called);
@@ -196,15 +217,18 @@ TEST(SessionTest, LogoutFlow) {
 TEST(SessionTest, SequenceNumberIncremented) {
     std::vector<std::string> sent;
     SessionCallbacks cbs;
-    cbs.do_send  = [&](const std::string& s){ sent.push_back(s); };
-    cbs.on_logon = [&](const SessionID&){};
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.on_logon = [&](const SessionID &) {
+    };
 
     auto store = std::make_unique<MemoryStore>();
     Session sess(make_cfg(false), std::move(store), nullptr, cbs);
     sess.logon();
 
     std::string logon = make_wire("FIX.4.2", msg_types::Logon, 1, "CLIENT", "SERVER",
-        {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
+                                  {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
     sess.on_data(logon.data(), logon.size());
 
     // After logon exchange: acceptor sent logon (from sess.logon()) +

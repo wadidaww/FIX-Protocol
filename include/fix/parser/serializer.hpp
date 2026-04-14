@@ -2,16 +2,17 @@
 // =============================================================================
 // FIX Protocol Engine - Message Serializer
 // =============================================================================
-#include "../core/types.hpp"
-#include "../core/field.hpp"
-#include "../core/message.hpp"
-#include "../core/constants.hpp"
+#include <charconv>
+#include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
-#include <span>
-#include <cstdint>
-#include <charconv>
+
+#include "../core/constants.hpp"
+#include "../core/field.hpp"
+#include "../core/message.hpp"
+#include "../core/types.hpp"
 
 namespace fix {
 
@@ -38,12 +39,10 @@ public:
         append_field(tags::MsgType, msg_type);
     }
 
-    void add(TagNum tag, std::string_view value) {
-        append_field(tag, value);
-    }
+    void add(TagNum tag, std::string_view value) { append_field(tag, value); }
 
     // Explicit const char* overload to prevent char*→bool conversion
-    void add(TagNum tag, const char* value) { add(tag, std::string_view(value)); }
+    void add(TagNum tag, const char *value) { add(tag, std::string_view(value)); }
 
     void add(TagNum tag, std::int64_t value) {
         char buf[24];
@@ -53,8 +52,8 @@ public:
 
     void add(TagNum tag, double value, int precision = 6) {
         char buf[64];
-        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value,
-                                       std::chars_format::fixed, precision);
+        auto [ptr, ec] =
+            std::to_chars(buf, buf + sizeof(buf), value, std::chars_format::fixed, precision);
         add(tag, std::string_view(buf, ptr - buf));
     }
 
@@ -63,30 +62,21 @@ public:
     }
 
     // Serialize a complete Message object into wire format
-    [[nodiscard]] std::string serialize(const Message& msg,
-                                        std::string_view begin_string,
-                                        SeqNum seq_num,
-                                        std::string_view sender,
-                                        std::string_view target,
-                                        std::string_view sending_time);
+    [[nodiscard]] std::string serialize(const Message &msg, std::string_view begin_string,
+                                        SeqNum seq_num, std::string_view sender,
+                                        std::string_view target, std::string_view sending_time);
 
     // Finalise: prefix BeginString + BodyLength, suffix CheckSum
-    [[nodiscard]] std::string finish() {
-        return build(begin_string_, body_);
-    }
+    [[nodiscard]] std::string finish() { return build(begin_string_, body_); }
 
     // Static helpers
-    [[nodiscard]] static std::string build(std::string_view begin_string,
-                                           std::string_view body);
+    [[nodiscard]] static std::string build(std::string_view begin_string, std::string_view body);
 
-    [[nodiscard]] static std::uint8_t compute_checksum(const char* data,
-                                                        std::size_t len) noexcept;
+    [[nodiscard]] static std::uint8_t compute_checksum(const char *data, std::size_t len) noexcept;
 
     // Format a UTC timestamp as FIX UTCTimestamp: YYYYMMDD-HH:MM:SS.sss
     [[nodiscard]] static std::string format_timestamp(TimePoint tp);
-    [[nodiscard]] static std::string format_timestamp_now() {
-        return format_timestamp(now());
-    }
+    [[nodiscard]] static std::string format_timestamp_now() { return format_timestamp(now()); }
 
 private:
     std::string begin_string_;

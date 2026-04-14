@@ -2,15 +2,16 @@
 // =============================================================================
 // FIX Protocol Engine - Streaming SOH-delimited Parser
 // =============================================================================
-#include "../core/types.hpp"
-#include "../core/field.hpp"
-#include "../core/message.hpp"
-#include "../core/constants.hpp"
+#include <cstdint>
+#include <functional>
 #include <span>
 #include <string_view>
 #include <vector>
-#include <functional>
-#include <cstdint>
+
+#include "../core/constants.hpp"
+#include "../core/field.hpp"
+#include "../core/message.hpp"
+#include "../core/types.hpp"
 
 namespace fix {
 
@@ -29,9 +30,9 @@ enum class ParseEvent : std::uint8_t {
 // error when used as a default parameter.
 // ---------------------------------------------------------------------------
 struct StreamParserOptions {
-    bool        validate_checksum = true;
-    bool        validate_body_len = true;
-    std::size_t max_msg_len       = 1u << 20; // 1 MB
+    bool validate_checksum = true;
+    bool validate_body_len = true;
+    std::size_t max_msg_len = 1u << 20; // 1 MB
 };
 
 // ---------------------------------------------------------------------------
@@ -49,36 +50,36 @@ public:
 
     // Feed raw bytes into the parser.
     void feed(std::span<const std::byte> data);
-    void feed(const char* data, std::size_t len);
+    void feed(const char *data, std::size_t len);
 
     // Returns true and fills `out` if a complete, valid message is available.
-    bool next(Message& out);
+    bool next(Message &out);
 
     // Reset parser state (e.g., after a session reset)
     void reset();
 
-    [[nodiscard]] std::size_t     bytes_consumed() const noexcept { return consumed_; }
-    [[nodiscard]] std::uint64_t   msg_count()      const noexcept { return msg_count_; }
-    [[nodiscard]] std::error_code last_error()     const noexcept { return last_error_; }
+    [[nodiscard]] std::size_t bytes_consumed() const noexcept { return consumed_; }
+    [[nodiscard]] std::uint64_t msg_count() const noexcept { return msg_count_; }
+    [[nodiscard]] std::error_code last_error() const noexcept { return last_error_; }
 
 private:
     std::vector<char> buf_;
-    std::size_t       read_pos_    = 0;
-    std::size_t       write_pos_   = 0;
-    std::size_t       consumed_    = 0;
-    std::uint64_t     msg_count_   = 0;
-    std::error_code   last_error_;
-    Options           opts_;
+    std::size_t read_pos_ = 0;
+    std::size_t write_pos_ = 0;
+    std::size_t consumed_ = 0;
+    std::uint64_t msg_count_ = 0;
+    std::error_code last_error_;
+    Options opts_;
 
     std::vector<Message> pending_;
-    std::size_t          pending_pos_ = 0;
+    std::size_t pending_pos_ = 0;
 
     void compact();
     bool try_parse_one();
 
-    static std::size_t parse_field(const char* data, std::size_t len,
-                                    TagNum& tag, std::string_view& value);
-    static std::uint8_t  compute_checksum(const char* data, std::size_t len) noexcept;
+    static std::size_t parse_field(const char *data, std::size_t len, TagNum &tag,
+                                   std::string_view &value);
+    static std::uint8_t compute_checksum(const char *data, std::size_t len) noexcept;
     static std::uint32_t checksum_to_int(std::string_view sv) noexcept;
 };
 

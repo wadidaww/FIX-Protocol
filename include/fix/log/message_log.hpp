@@ -2,24 +2,25 @@
 // =============================================================================
 // FIX Protocol Engine - Audit Log
 // =============================================================================
-#include "../core/types.hpp"
-#include <string>
-#include <string_view>
+#include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
-#include <mutex>
-#include <atomic>
-#include <thread>
-#include <queue>
-#include <condition_variable>
 #include <functional>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <string_view>
+#include <thread>
+
+#include "../core/types.hpp"
 
 namespace fix {
 
 struct AuditEntry {
-    TimePoint   timestamp;
+    TimePoint timestamp;
     std::string session_id;
-    bool        outbound;    // true=sent, false=received
+    bool outbound; // true=sent, false=received
     std::string raw;
 };
 
@@ -41,10 +42,10 @@ class FileAuditLog : public IAuditLog {
 public:
     struct Config {
         std::filesystem::path dir;
-        std::string           base_name  = "fix_audit";
-        std::size_t           max_size   = 100 * 1024 * 1024; // 100 MB
-        bool                  compress   = false;
-        int                   retain_days = 7;
+        std::string base_name = "fix_audit";
+        std::size_t max_size = 100 * 1024 * 1024; // 100 MB
+        bool compress = false;
+        int retain_days = 7;
     };
 
     explicit FileAuditLog(Config cfg);
@@ -55,17 +56,17 @@ public:
     void rotate() override;
 
 private:
-    Config          cfg_;
-    std::mutex      queue_mutex_;
+    Config cfg_;
+    std::mutex queue_mutex_;
     std::condition_variable cv_;
-    std::queue<AuditEntry>  queue_;
-    std::atomic<bool>       running_{true};
-    std::thread             writer_thread_;
-    std::ofstream           out_;
-    std::size_t             current_size_ = 0;
+    std::queue<AuditEntry> queue_;
+    std::atomic<bool> running_{true};
+    std::thread writer_thread_;
+    std::ofstream out_;
+    std::size_t current_size_ = 0;
 
     void write_loop();
-    void write_entry(const AuditEntry& e);
+    void write_entry(const AuditEntry &e);
     void open_file();
 };
 

@@ -1,9 +1,10 @@
 // =============================================================================
 // FIX Protocol Engine - Message unit tests
 // =============================================================================
-#include <gtest/gtest.h>
-#include "fix/core/message.hpp"
 #include "fix/core/constants.hpp"
+#include "fix/core/message.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace fix;
 
@@ -20,8 +21,9 @@ TEST(MessageTest, SetOverwrites) {
     EXPECT_EQ(m.get(tags::Symbol).value_or(""), "MSFT");
     // Only one instance
     int count = 0;
-    for (const auto& f : m.fields()) {
-        if (f.tag == tags::Symbol) ++count;
+    for (const auto &f : m.fields()) {
+        if (f.tag == tags::Symbol)
+            ++count;
     }
     EXPECT_EQ(count, 1);
 }

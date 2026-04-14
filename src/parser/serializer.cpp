@@ -2,23 +2,23 @@
 // FIX Protocol Engine - MessageBuilder / Serializer implementation
 // =============================================================================
 #include "fix/parser/serializer.hpp"
+
+#include <chrono>
 #include <cstring>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
-#include <chrono>
 
 namespace fix {
 
-std::uint8_t MessageBuilder::compute_checksum(const char* data, std::size_t len) noexcept {
+std::uint8_t MessageBuilder::compute_checksum(const char *data, std::size_t len) noexcept {
     std::uint32_t sum = 0;
     for (std::size_t i = 0; i < len; ++i)
         sum += static_cast<unsigned char>(data[i]);
     return static_cast<std::uint8_t>(sum & 0xFF);
 }
 
-std::string MessageBuilder::build(std::string_view begin_string,
-                                   std::string_view body) {
+std::string MessageBuilder::build(std::string_view begin_string, std::string_view body) {
     // Header: "8=FIX.4.2\x01 9=<len>\x01"
     // Body:   already built (does NOT include tag 8/9)
     // Trailer: "10=<checksum>\x01"
@@ -56,12 +56,9 @@ std::string MessageBuilder::build(std::string_view begin_string,
     return result;
 }
 
-std::string MessageBuilder::serialize(const Message& msg,
-                                       std::string_view begin_string,
-                                       SeqNum seq_num,
-                                       std::string_view sender,
-                                       std::string_view target,
-                                       std::string_view sending_time) {
+std::string MessageBuilder::serialize(const Message &msg, std::string_view begin_string,
+                                      SeqNum seq_num, std::string_view sender,
+                                      std::string_view target, std::string_view sending_time) {
     begin(begin_string, msg.msg_type());
     // Standard header fields (after 8, 9, 35)
     add(tags::SenderCompID, sender);
@@ -70,15 +67,10 @@ std::string MessageBuilder::serialize(const Message& msg,
     add(tags::SendingTime, sending_time);
 
     // Body fields (skip header/trailer tags we already handle)
-    for (const auto& f : msg.fields()) {
-        if (f.tag == tags::BeginString    ||
-            f.tag == tags::BodyLength     ||
-            f.tag == tags::MsgType        ||
-            f.tag == tags::SenderCompID   ||
-            f.tag == tags::TargetCompID   ||
-            f.tag == tags::MsgSeqNum      ||
-            f.tag == tags::SendingTime    ||
-            f.tag == tags::CheckSum) {
+    for (const auto &f : msg.fields()) {
+        if (f.tag == tags::BeginString || f.tag == tags::BodyLength || f.tag == tags::MsgType ||
+            f.tag == tags::SenderCompID || f.tag == tags::TargetCompID ||
+            f.tag == tags::MsgSeqNum || f.tag == tags::SendingTime || f.tag == tags::CheckSum) {
             continue;
         }
         add(f.tag, f.value);
@@ -88,8 +80,7 @@ std::string MessageBuilder::serialize(const Message& msg,
 
 std::string MessageBuilder::format_timestamp(TimePoint tp) {
     auto tt = std::chrono::system_clock::to_time_t(tp);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  tp.time_since_epoch()) % 1000;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()) % 1000;
     std::tm tmv{};
 #if defined(_WIN32)
     gmtime_s(&tmv, &tt);
@@ -97,10 +88,8 @@ std::string MessageBuilder::format_timestamp(TimePoint tp) {
     gmtime_r(&tt, &tmv);
 #endif
     char buf[64];
-    std::snprintf(buf, sizeof(buf),
-                  "%04d%02d%02d-%02d:%02d:%02d.%03d",
-                  tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                  tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+    std::snprintf(buf, sizeof(buf), "%04d%02d%02d-%02d:%02d:%02d.%03d", tmv.tm_year + 1900,
+                  tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
                   static_cast<int>(ms.count()));
     return buf;
 }

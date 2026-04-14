@@ -2,13 +2,14 @@
 // =============================================================================
 // FIX Protocol Engine - File-Based Message Store (mmap append-only log)
 // =============================================================================
-#include "message_store.hpp"
+#include <atomic>
 #include <filesystem>
 #include <fstream>
-#include <mutex>
-#include <atomic>
 #include <map>
+#include <mutex>
 #include <string>
+
+#include "message_store.hpp"
 
 namespace fix {
 
@@ -21,7 +22,7 @@ namespace fix {
 // ---------------------------------------------------------------------------
 class FileStore : public IMessageStore {
 public:
-    explicit FileStore(std::filesystem::path dir, const SessionID& sid);
+    explicit FileStore(std::filesystem::path dir, const SessionID &sid);
     ~FileStore();
 
     SeqNum next_sender_seq_num() const noexcept override {
@@ -35,11 +36,10 @@ public:
     void incr_sender_seq_num() override;
     void incr_target_seq_num() override;
 
-    Result<void> store_outbound(SeqNum seq, const std::string& raw) override;
-    Result<void> store_inbound(SeqNum seq, const std::string& raw)  override;
-    Result<void> get_messages(SeqNum begin, SeqNum end,
-                               MessageCallback cb) const override;
-    Result<void> reset()   override;
+    Result<void> store_outbound(SeqNum seq, const std::string &raw) override;
+    Result<void> store_inbound(SeqNum seq, const std::string &raw) override;
+    Result<void> get_messages(SeqNum begin, SeqNum end, MessageCallback cb) const override;
+    Result<void> reset() override;
     Result<void> refresh() override;
 
 private:
@@ -48,11 +48,11 @@ private:
     std::filesystem::path outfile_;
     std::filesystem::path infile_;
 
-    std::atomic<SeqNum>          sender_seq_{1};
-    std::atomic<SeqNum>          target_seq_{1};
-    mutable std::mutex           mutex_;
-    std::ofstream                out_stream_;
-    std::ofstream                in_stream_;
+    std::atomic<SeqNum> sender_seq_{1};
+    std::atomic<SeqNum> target_seq_{1};
+    mutable std::mutex mutex_;
+    std::ofstream out_stream_;
+    std::ofstream in_stream_;
     // In-memory index: seq -> byte offset in outfile
     std::map<SeqNum, std::streampos> out_index_;
 

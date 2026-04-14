@@ -216,6 +216,32 @@ write_basic_package_version_file(
 )
 
 # =============================================================================
+# clang-format targets
+# =============================================================================
+find_program(CLANG_FORMAT_EXE NAMES clang-format clang-format-18 clang-format-17)
+if(CLANG_FORMAT_EXE)
+    file(
+        GLOB_RECURSE ALL_CXX_SOURCE_FILES
+        "${PROJECT_SOURCE_DIR}/include/*.hpp"
+        "${PROJECT_SOURCE_DIR}/src/*.cpp"
+        "${PROJECT_SOURCE_DIR}/tests/*.cpp"
+        "${PROJECT_SOURCE_DIR}/apps/*.cpp"
+    )
+    add_custom_target(
+        format
+        COMMAND ${CLANG_FORMAT_EXE} -i --style=file ${ALL_CXX_SOURCE_FILES}
+        COMMENT "Running clang-format on all sources"
+        VERBATIM
+    )
+    add_custom_target(
+        format-check
+        COMMAND ${CLANG_FORMAT_EXE} --dry-run --Werror --style=file ${ALL_CXX_SOURCE_FILES}
+        COMMENT "Checking clang-format compliance"
+        VERBATIM
+    )
+endif()
+
+# =============================================================================
 # Summary
 # =============================================================================
 message(STATUS "=== FIX Protocol Engine ===")

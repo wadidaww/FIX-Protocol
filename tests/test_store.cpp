@@ -1,11 +1,13 @@
 // =============================================================================
 // FIX Protocol Engine - Store unit tests
 // =============================================================================
-#include <gtest/gtest.h>
-#include "fix/store/memory_store.hpp"
 #include "fix/store/file_store.hpp"
+#include "fix/store/memory_store.hpp"
+
 #include <filesystem>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 using namespace fix;
 
@@ -42,12 +44,11 @@ TEST(MemoryStoreTest, StoreAndRetrieve) {
     s.store_outbound(3, "MSG3");
 
     std::vector<std::pair<SeqNum, std::string>> collected;
-    s.get_messages(1, 3, [&](SeqNum seq, const std::string& raw){
-        collected.emplace_back(seq, raw);
-    });
+    s.get_messages(1, 3,
+                   [&](SeqNum seq, const std::string &raw) { collected.emplace_back(seq, raw); });
 
     ASSERT_EQ(collected.size(), 3u);
-    EXPECT_EQ(collected[0].first,  1u);
+    EXPECT_EQ(collected[0].first, 1u);
     EXPECT_EQ(collected[0].second, "MSG1");
     EXPECT_EQ(collected[2].second, "MSG3");
 }
@@ -59,7 +60,7 @@ TEST(MemoryStoreTest, GetMessagesRange) {
     }
 
     std::vector<SeqNum> seqs;
-    s.get_messages(2, 4, [&](SeqNum seq, const std::string&){ seqs.push_back(seq); });
+    s.get_messages(2, 4, [&](SeqNum seq, const std::string &) { seqs.push_back(seq); });
 
     ASSERT_EQ(seqs.size(), 3u);
     EXPECT_EQ(seqs[0], 2u);
@@ -75,7 +76,7 @@ TEST(MemoryStoreTest, Reset) {
     EXPECT_EQ(s.next_sender_seq_num(), 1u);
 
     std::vector<std::string> msgs;
-    s.get_messages(1, 10, [&](SeqNum, const std::string& r){ msgs.push_back(r); });
+    s.get_messages(1, 10, [&](SeqNum, const std::string &r) { msgs.push_back(r); });
     EXPECT_TRUE(msgs.empty());
 }
 
@@ -92,11 +93,9 @@ protected:
         std::filesystem::create_directories(tmpdir);
         sid.senderCompID = "SENDER";
         sid.targetCompID = "TARGET";
-        sid.version      = FixVersion::FIX_4_4;
+        sid.version = FixVersion::FIX_4_4;
     }
-    void TearDown() override {
-        std::filesystem::remove_all(tmpdir);
-    }
+    void TearDown() override { std::filesystem::remove_all(tmpdir); }
 };
 
 TEST_F(FileStoreTest, InitialSeqNums) {
@@ -123,7 +122,7 @@ TEST_F(FileStoreTest, StoreAndRetrieve) {
     s.store_outbound(2, "RAWMSG2");
 
     std::vector<std::string> msgs;
-    s.get_messages(1, 2, [&](SeqNum, const std::string& r){ msgs.push_back(r); });
+    s.get_messages(1, 2, [&](SeqNum, const std::string &r) { msgs.push_back(r); });
 
     ASSERT_EQ(msgs.size(), 2u);
     EXPECT_EQ(msgs[0], "RAWMSG1");
@@ -139,7 +138,7 @@ TEST_F(FileStoreTest, Reset) {
     EXPECT_EQ(s.next_sender_seq_num(), 1u);
 
     std::vector<std::string> msgs;
-    s.get_messages(1, 10, [&](SeqNum, const std::string& r){ msgs.push_back(r); });
+    s.get_messages(1, 10, [&](SeqNum, const std::string &r) { msgs.push_back(r); });
     EXPECT_TRUE(msgs.empty());
 }
 

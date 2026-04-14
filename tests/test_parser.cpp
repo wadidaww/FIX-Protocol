@@ -1,10 +1,11 @@
 // =============================================================================
 // FIX Protocol Engine - Parser unit tests
 // =============================================================================
-#include <gtest/gtest.h>
+#include "fix/core/constants.hpp"
 #include "fix/parser/parser.hpp"
 #include "fix/parser/serializer.hpp"
-#include "fix/core/constants.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace fix;
 
@@ -62,7 +63,10 @@ TEST(ParserTest, HandlesPartialFeed) {
     for (std::size_t i = 0; i < wire.size(); i += 3) {
         std::size_t chunk = std::min(std::size_t(3), wire.size() - i);
         p.feed(wire.data() + i, chunk);
-        if (p.next(msg)) { got = true; break; }
+        if (p.next(msg)) {
+            got = true;
+            break;
+        }
     }
     EXPECT_TRUE(got);
     EXPECT_EQ(msg.msg_type(), msg_types::Logon);
@@ -169,7 +173,7 @@ TEST(SerializerTest, BodyLengthIsCorrect) {
 
     // Body starts after "9=NNN\x01" and ends before "10=NNN\x01"
     auto body_start = soh9 + 1;
-    auto cs_pos     = wire.rfind("10=");
+    auto cs_pos = wire.rfind("10=");
     ASSERT_NE(cs_pos, std::string::npos);
 
     int actual_body = static_cast<int>(cs_pos - body_start);
@@ -203,20 +207,19 @@ TEST(SerializerTest, TimestampFormat) {
 TEST(SerializerTest, SerializeMessage) {
     Message order(msg_types::NewOrderSingle);
     order.set(tags::ClOrdID, "ORD001");
-    order.set(tags::Symbol,  "AAPL");
-    order.set(tags::Side,    "1");
+    order.set(tags::Symbol, "AAPL");
+    order.set(tags::Side, "1");
     order.set(tags::OrderQty, 100.0);
     order.set(tags::OrdType, "2");
     order.set(tags::TransactTime, "20240101-12:00:00.000");
 
     MessageBuilder b;
-    std::string wire = b.serialize(order, "FIX.4.2", 42,
-                                    "SENDER", "TARGET",
-                                    "20240101-12:00:00.000");
+    std::string wire =
+        b.serialize(order, "FIX.4.2", 42, "SENDER", "TARGET", "20240101-12:00:00.000");
     EXPECT_FALSE(wire.empty());
     EXPECT_NE(wire.find("8=FIX.4.2"), std::string::npos);
-    EXPECT_NE(wire.find("35=D"),      std::string::npos);
+    EXPECT_NE(wire.find("35=D"), std::string::npos);
     EXPECT_NE(wire.find("11=ORD001"), std::string::npos);
-    EXPECT_NE(wire.find("55=AAPL"),   std::string::npos);
-    EXPECT_NE(wire.find("34=42"),     std::string::npos);
+    EXPECT_NE(wire.find("55=AAPL"), std::string::npos);
+    EXPECT_NE(wire.find("34=42"), std::string::npos);
 }
