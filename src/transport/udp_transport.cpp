@@ -116,12 +116,12 @@ Result<void> UdpTransport::open_socket() {
 
         // Set TTL for outgoing multicast datagrams.
         unsigned char ttl = cfg_.multicast_ttl;
-        ::setsockopt(sock_fd_, IPPROTO_IP, IP_MULTICAST_TTL,
-                     reinterpret_cast<const char *>(&ttl), sizeof(ttl));
+        ::setsockopt(sock_fd_, IPPROTO_IP, IP_MULTICAST_TTL, reinterpret_cast<const char *>(&ttl),
+                     sizeof(ttl));
 
         // Set outgoing multicast interface if provided.
         if (!cfg_.multicast_iface.empty()) {
-            struct in_addr iface{};
+            struct in_addr iface {};
             ::inet_pton(AF_INET, cfg_.multicast_iface.c_str(), &iface);
             ::setsockopt(sock_fd_, IPPROTO_IP, IP_MULTICAST_IF,
                          reinterpret_cast<const char *>(&iface), sizeof(iface));
@@ -134,7 +134,8 @@ Result<void> UdpTransport::open_socket() {
         remote_addr_.sin_family = AF_INET;
         remote_addr_.sin_port = htons(cfg_.remote_port);
 
-        struct addrinfo hints{}, *res = nullptr;
+        struct addrinfo hints {
+        }, *res = nullptr;
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_DGRAM;
         std::string port_str = std::to_string(cfg_.remote_port);
@@ -230,8 +231,8 @@ Result<void> UdpTransport::send(const char *data, std::size_t len) {
     if (!remote_resolved_)
         return make_unexpected(ErrorCode::TransportError);
 
-    ssize_t n = ::sendto(sock_fd_, data, len, 0,
-                         reinterpret_cast<const sockaddr *>(&remote_addr_), sizeof(remote_addr_));
+    ssize_t n = ::sendto(sock_fd_, data, len, 0, reinterpret_cast<const sockaddr *>(&remote_addr_),
+                         sizeof(remote_addr_));
     if (n < 0)
         return make_unexpected(ErrorCode::TransportError);
 #endif

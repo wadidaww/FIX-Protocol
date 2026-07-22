@@ -22,7 +22,7 @@
 
 #include "transport.hpp"
 
-#ifdef __linux__
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -67,9 +67,11 @@ private:
 
     int sock_fd_ = -1;
 
+#ifndef _WIN32
     // Resolved remote address (for sending)
     struct sockaddr_in remote_addr_ {};
     bool remote_resolved_ = false;
+#endif
 
     Result<void> open_socket();
     void close_socket();

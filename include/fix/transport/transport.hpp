@@ -92,8 +92,8 @@ struct UdpTransportConfig {
 
     // Multicast settings (ignored when multicast = false).
     bool multicast = false;
-    std::string multicast_group;     // e.g. "239.0.0.1"
-    std::string multicast_iface;     // local interface IP for join/send
+    std::string multicast_group; // e.g. "239.0.0.1"
+    std::string multicast_iface; // local interface IP for join/send
     std::uint8_t multicast_ttl = 8;
 
     // initiator = sender (write-only direction matters for routing),
@@ -117,9 +117,9 @@ struct BackendEndpoint {
 // Load-balancer strategy
 // ---------------------------------------------------------------------------
 enum class LbStrategy : std::uint8_t {
-    RoundRobin = 0,   // cycle through all healthy backends
-    Failover = 1,     // always use primary; fall back only when it is down
-    WeightedRR = 2,   // weighted round-robin proportional to BackendEndpoint::weight
+    RoundRobin = 0, // cycle through all healthy backends
+    Failover = 1,   // always use primary; fall back only when it is down
+    WeightedRR = 2, // weighted round-robin proportional to BackendEndpoint::weight
 };
 
 // ---------------------------------------------------------------------------
@@ -142,10 +142,8 @@ std::unique_ptr<ITransport> make_load_balancer(LoadBalancerConfig cfg);
 
 /// Convenience: choose TCP or UDP automatically from a single protocol flag.
 /// For FIX order-management use TCP; for market-data feeds use UDP.
-inline std::unique_ptr<ITransport> make_transport(TransportProtocol proto,
-                                                   const std::string &host,
-                                                   std::uint16_t port,
-                                                   bool initiator = true) {
+inline std::unique_ptr<ITransport> make_transport(TransportProtocol proto, const std::string &host,
+                                                  std::uint16_t port, bool initiator = true) {
     if (proto == TransportProtocol::UDP) {
         UdpTransportConfig cfg;
         if (initiator) {
