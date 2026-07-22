@@ -1,0 +1,5 @@
+if(EXISTS "/home/runner/work/FIX-Protocol/FIX-Protocol/build_test/fix_tests[1]_tests.cmake")
+  include("/home/runner/work/FIX-Protocol/FIX-Protocol/build_test/fix_tests[1]_tests.cmake")
+else()
+  add_test(fix_tests_NOT_BUILT fix_tests_NOT_BUILT)
+endif()

@@ -92,6 +92,8 @@ set(FIX_SOURCES
     src/session/session_manager.cpp
     src/store/file_store.cpp
     src/transport/tcp_transport.cpp
+    src/transport/udp_transport.cpp
+    src/transport/load_balancer.cpp
     src/log/message_log.cpp
     src/engine.cpp
 )
@@ -111,6 +113,8 @@ set(FIX_HEADERS
     include/fix/store/file_store.hpp
     include/fix/transport/transport.hpp
     include/fix/transport/tcp_transport.hpp
+    include/fix/transport/udp_transport.hpp
+    include/fix/transport/load_balancer.hpp
     include/fix/log/message_log.hpp
     include/fix/engine.hpp
 )
