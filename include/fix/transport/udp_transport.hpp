@@ -1,33 +1,41 @@
 #pragma once
 // =============================================================================
-// FIX Protocol Engine - TCP Transport (epoll-based, Linux/POSIX)
+// FIX Protocol Engine - UDP Transport
+//
+// Supports:
+//   * Unicast UDP (send/receive between two endpoints)
+//   * IP Multicast (join group, send to group – useful for market-data feeds)
+//
+// Notes:
+//   - UDP is connectionless; `is_connected()` returns true once the socket is
+//     successfully bound/opened.
+//   - Because UDP is unreliable, this transport is most appropriate for
+//     one-way market-data broadcasts.  For order-management (where FIX
+//     sequence integrity is required) use TcpTransport instead.
+//   - on_connected is fired once the socket is ready.
+//   - on_disconnected is fired only when stop() is called.
 // =============================================================================
 #include <atomic>
-#include <deque>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "transport.hpp"
 
-#ifdef __linux__
+#ifndef _WIN32
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
 
 namespace fix {
 
-class TcpTransport : public ITransport {
+class UdpTransport : public ITransport {
 public:
-    explicit TcpTransport(TcpTransportConfig cfg);
-    ~TcpTransport() override;
+    explicit UdpTransport(UdpTransportConfig cfg);
+    ~UdpTransport() override;
 
     void set_on_connected(ConnectedCallback cb) override { on_connected_ = std::move(cb); }
     void set_on_disconnected(DisconnectedCallback cb) override { on_disconnected_ = std::move(cb); }
@@ -37,46 +45,37 @@ public:
     Result<void> start() override;
     void stop() override;
     Result<void> send(const char *data, std::size_t len) override;
+
     [[nodiscard]] bool is_connected() const noexcept override {
-        return connected_.load(std::memory_order_acquire);
+        return socket_ready_.load(std::memory_order_acquire);
     }
     [[nodiscard]] TransportProtocol protocol() const noexcept override {
-        return TransportProtocol::TCP;
+        return TransportProtocol::UDP;
     }
 
 private:
-    TcpTransportConfig cfg_;
+    UdpTransportConfig cfg_;
+
     ConnectedCallback on_connected_;
     DisconnectedCallback on_disconnected_;
     DataCallback on_data_;
     ErrorCallback on_error_;
 
     std::atomic<bool> running_{false};
-    std::atomic<bool> connected_{false};
-    std::thread io_thread_;
+    std::atomic<bool> socket_ready_{false};
+    std::thread recv_thread_;
 
-    // Socket handles
-    int listen_fd_ = -1;
-    int conn_fd_ = -1;
-#ifdef __linux__
-    int epoll_fd_ = -1;
+    int sock_fd_ = -1;
+
+#ifndef _WIN32
+    // Resolved remote address (for sending)
+    struct sockaddr_in remote_addr_ {};
+    bool remote_resolved_ = false;
 #endif
 
-    // Send queue
-    std::mutex send_mutex_;
-    std::deque<std::string> send_queue_;
-    std::vector<char> recv_buf_;
-
-    void run_acceptor();
-    void run_initiator();
-    void run_event_loop(int fd);
-    void do_connect(const std::string &host, std::uint16_t port);
-
-    static int make_nonblocking(int fd);
-    static int tcp_nodelay(int fd);
-    void handle_recv(int fd);
-    void handle_send(int fd);
-    void close_connection();
+    Result<void> open_socket();
+    void close_socket();
+    void recv_loop();
 };
 
 } // namespace fix
