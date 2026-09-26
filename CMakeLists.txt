@@ -175,6 +175,7 @@ if(FIX_BUILD_TESTS)
         tests/test_dictionary.cpp
         tests/test_store.cpp
         tests/test_e2e.cpp
+        tests/test_e2e_timers.cpp
     )
 
     target_link_libraries(fix_tests

@@ -399,6 +399,91 @@ TEST(EndToEnd, AcceptorRecoversAfterDisconnect) {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. ResetSeqNumFlag convergence: BOTH sides with reset_on_logon=true must
+//     complete the handshake and exchange application messages in both
+//     directions. The acceptor's Logon reply echoes 141=Y; an inbound 141
+//     re-baselines only what we EXPECT FROM THE PEER (target), never our own
+//     outbound numbering — rewinding the sender on that echo reused a burned
+//     sequence and the next send() was dropped as "MsgSeqNum too low" (a
+//     skew observed mid-Phase-2 and worked around in test_e2e_timers).
+// ---------------------------------------------------------------------------
+TEST(EndToEnd, ResetOnLogonBothSidesConverges) {
+#ifdef _WIN32
+    GTEST_SKIP() << "TCP transport is a documented no-op on Windows";
+#endif
+    const std::uint16_t port = find_free_port();
+    ASSERT_NE(port, 0);
+
+    Engine engine(make_engine_config());
+    Endpoints ep;
+
+    SessionConfig acc_cfg = make_session_cfg("SERVER", "CLIENT", /*initiator=*/false);
+    acc_cfg.reset_on_logon = true;
+    SessionConfig init_cfg = make_session_cfg("CLIENT", "SERVER", /*initiator=*/true);
+    init_cfg.reset_on_logon = true;
+
+    SessionCallbacks acceptor_cbs;
+    acceptor_cbs.on_logon = [&](const SessionID &) {
+        ep.acceptor_logged_on.store(true);
+    };
+    acceptor_cbs.on_message = [&](const SessionID &, const Message &m) {
+        ep.on_acceptor_message(m);
+    };
+    Session *acceptor = engine.add_session(
+        acc_cfg, make_tcp_transport(make_transport_cfg(port, false)), acceptor_cbs);
+    ASSERT_NE(acceptor, nullptr);
+
+    SessionCallbacks initiator_cbs;
+    initiator_cbs.on_logon = [&](const SessionID &) {
+        ep.initiator_logged_on.store(true);
+    };
+    initiator_cbs.on_message = [&](const SessionID &, const Message &m) {
+        ep.on_initiator_message(m);
+    };
+    Session *initiator = engine.add_session(
+        init_cfg, make_tcp_transport(make_transport_cfg(port, true)), initiator_cbs);
+    ASSERT_NE(initiator, nullptr);
+
+    ASSERT_TRUE(engine.start().has_value());
+    ASSERT_TRUE(wait_until(
+        [&] { return ep.acceptor_logged_on.load() && ep.initiator_logged_on.load(); }, 15000ms))
+        << "reset handshake did not complete: acceptor=" << ep.acceptor_logged_on.load()
+        << " initiator=" << ep.initiator_logged_on.load();
+
+    // Post-handshake sequence numbers must have converged on BOTH sides:
+    // initiator -> acceptor.
+    Message order(msg_types::NewOrderSingle);
+    order.set(tags::ClOrdID, "ORD-RESET-1");
+    order.set(tags::Symbol, "MSFT");
+    order.set(tags::Side, "1");
+    order.set(tags::OrdType, "2");
+    auto sent = initiator->send(order);
+    ASSERT_TRUE(sent.has_value()) << "post-reset initiator send failed: " << sent.error().message();
+    ASSERT_TRUE(wait_until([&] { return ep.acceptor_got("ORD-RESET-1"); }, 10000ms))
+        << "message after reset handshake never reached the acceptor";
+
+    // ... and acceptor -> initiator (the reverse direction is where the
+    // burned-sender-seq skew showed up: the acceptor's reply was dropped).
+    Message ack(msg_types::ExecutionReport);
+    ack.set(tags::ClOrdID, "ORD-RESET-1");
+    ack.set(tags::OrderID, "EX-RESET-1");
+    ASSERT_TRUE(acceptor->send(ack).has_value())
+        << "post-reset acceptor send failed (MsgSeqNum too low skew?)";
+    ASSERT_TRUE(wait_until(
+        [&] {
+            std::lock_guard lk(ep.mtx);
+            for (const auto &m : ep.initiator_received)
+                if (m.msg_type() == msg_types::ExecutionReport)
+                    return true;
+            return false;
+        },
+        10000ms))
+        << "ExecutionReport after reset handshake never reached the initiator";
+
+    engine.stop();
+}
+
+// ---------------------------------------------------------------------------
 // 4. F1 regression: a raw peer sending a Logon with the WRONG CompID must get
 //    a Logout followed by a CLOSED connection (recv()==0) — Session::
 //    disconnect() has to invoke do_disconnect so the transport actually drops

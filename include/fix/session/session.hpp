@@ -10,6 +10,8 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "../core/constants.hpp"
 #include "../core/message.hpp"
@@ -44,16 +46,21 @@ struct SessionConfig {
 
 // ---------------------------------------------------------------------------
 // Session FSM states
+//
+// Phase 2 (2.4): `LogoutReceived` is gone — a peer-initiated Logout is
+// answered with an echo Logout and the session goes straight to Disconnected
+// (the intermediate state only created a window for the timer thread to run
+// with a half-torn-down session). `Reconnecting` is gone too: it was never
+// written anywhere (grep-verified); reconnection is owned by the transport,
+// which calls on_transport_connected() when the byte stream is back.
 // ---------------------------------------------------------------------------
 enum class SessionState : std::uint8_t {
     NotConnected,
-    WaitingLogon,   // acceptor waiting for logon
-    LogonSent,      // initiator sent logon
-    Active,         // session established
-    LogoutSent,     // we sent logout
-    LogoutReceived, // peer sent logout, we're draining
-    Reconnecting,   // backing off before retry
-    Disconnected,   // terminal
+    WaitingLogon, // acceptor waiting for logon
+    LogonSent,    // initiator sent logon
+    Active,       // session established
+    LogoutSent,   // we sent logout
+    Disconnected, // terminal
 };
 
 std::string_view to_string(SessionState s) noexcept;
@@ -72,6 +79,16 @@ struct SessionCallbacks {
     // Message received (called for application-level messages)
     std::function<void(const SessionID &, const Message &)> on_message;
 
+    // A session-level Reject (35=3) was received from the counterparty.
+    // Optional: no-op when unset. (2.5)
+    std::function<void(const SessionID &, SeqNum ref_seq, std::string_view text)> on_reject;
+
+    // Error sink for failures that would otherwise be swallowed (a user
+    // callback threw, ...). Optional: when unset the engine has no logging
+    // infrastructure, so the error is dropped — this callback is the
+    // documented floor for surfacing it. (2.6)
+    std::function<void(const SessionID &, std::string_view what)> on_error;
+
     // Transport send callback (engine calls this to write bytes to the wire)
     std::function<void(const std::string &)> do_send;
     std::function<void()> do_disconnect; // engine → ITransport::disconnect()
@@ -82,6 +99,9 @@ struct SessionCallbacks {
 // ---------------------------------------------------------------------------
 class Session {
 public:
+    // Milliseconds since the epoch as used by all session timestamps.
+    using Millis = std::chrono::milliseconds::rep;
+
     explicit Session(SessionConfig cfg, std::unique_ptr<IMessageStore> store,
                      const DataDictionary *dict = nullptr, SessionCallbacks cbs = {});
 
@@ -96,7 +116,9 @@ public:
     // Safe to call on every (re)connect.
     void on_transport_connected();
 
-    // Send an application message (seq assigned automatically)
+    // Send an application message (seq assigned automatically). Only valid
+    // while the session is Active — any other state returns SessionError so
+    // a disconnected session can no longer burn phantom sequence numbers.
     Result<void> send(Message msg);
 
     // Send a raw string (already serialized) – bypasses seq mgmt
@@ -117,6 +139,13 @@ public:
     // Resets session sequence numbers and state
     Result<void> reset();
 
+    // Test seam: replace the time source used for ALL session timing
+    // decisions (last_send/last_recv/logon/test-request/logout deadlines).
+    // Message SendingTime keeps using the real wall clock so the wire stays
+    // spec-conformant. Must be called before the session is driven (no
+    // concurrent traffic) — the previous source is dropped immediately.
+    void set_time_source_for_test(std::function<Millis()> clock);
+
     // Getters
     [[nodiscard]] const SessionID &id() const noexcept { return cfg_.id; }
     [[nodiscard]] SessionState state() const noexcept { return state_.load(); }
@@ -126,6 +155,15 @@ public:
     // For metrics
     [[nodiscard]] std::uint64_t msgs_sent() const noexcept { return msgs_sent_.load(); }
     [[nodiscard]] std::uint64_t msgs_received() const noexcept { return msgs_received_.load(); }
+    // Callback / processing errors surfaced through SessionCallbacks::on_error
+    // (plan 2.6: "replace silent catch with on_error callback + counter").
+    [[nodiscard]] std::uint64_t error_count() const noexcept { return errors_.load(); }
+    // Stored outbound frames that could not be parsed during a ResendRequest
+    // replay (2.2): they are never emitted verbatim, only covered by the
+    // enclosing gap-fill.
+    [[nodiscard]] std::uint64_t resend_corrupt_frames() const noexcept {
+        return resend_corrupt_.load();
+    }
 
 private:
     SessionConfig cfg_;
@@ -138,27 +176,47 @@ private:
     std::atomic<SessionState> state_{SessionState::NotConnected};
     std::atomic<std::uint64_t> msgs_sent_{0};
     std::atomic<std::uint64_t> msgs_received_{0};
+    std::atomic<std::uint64_t> errors_{0};
 
     mutable std::mutex send_mutex_;
 
-    // -- Shared timing state (F2) -------------------------------------------
+    // -- Shared timing state (F2 / 2.3) -------------------------------------
     // Epoch milliseconds, stored atomically: written on IO/user threads
-    // (process_message/send_message/send_logon) and read by the engine's
-    // timer thread (on_timer). Plain TimePoint members raced under TSAN.
-    using Millis = std::chrono::milliseconds::rep;
+    // (process_message/send_message/send_logon/send_logout) and read by the
+    // engine's timer thread (on_timer). Plain TimePoint members raced under
+    // TSAN.
     static Millis now_ms() noexcept;
+    // Virtual clock: null → now_ms(). Held via shared_ptr so the test seam
+    // can swap it without racing concurrent readers (atomic<shared_ptr>).
+    using ClockFn = std::function<Millis()>;
+    std::atomic<std::shared_ptr<const ClockFn>> clock_;
     std::atomic<Millis> last_send_time_ms_{0};
     std::atomic<Millis> last_recv_time_ms_{0};
     std::atomic<Millis> logon_sent_time_ms_{0};
+    // When the TestRequest we are awaiting was sent (2.3): the 1.2×HeartBtInt
+    // deadline is measured from THIS, not from last_recv.
+    std::atomic<Millis> test_req_sent_time_ms_{0};
+    // When our Logout went out (2.3): logout_timeout while LogoutSent.
+    std::atomic<Millis> logout_sent_time_ms_{0};
 
-    // -- TestRequest round-trip bookkeeping (F2) ----------------------------
-    // The flag is written by the timer thread (send_test_request) and IO
-    // thread (handle_heartbeat / on_transport_connected / disconnect); the
-    // ID string is guarded by test_req_mtx_ — the mutex is only ever held
-    // for the string itself, never across sends or user callbacks.
+    // -- TestRequest round-trip bookkeeping (F2 / 2.3) ----------------------
+    // The flag is written by the timer thread (send_test_request) and the IO
+    // thread (any inbound message clears it — relaxed liveness rule — plus
+    // disconnect/reset/on_transport_connected); the ID string is guarded by
+    // test_req_mtx_ — the mutex is only ever held for the string itself,
+    // never across sends or user callbacks.
     mutable std::mutex test_req_mtx_;
     std::string pending_test_req_id_;
     std::atomic<bool> test_req_pending_{false};
+
+    // -- Sequence-gap throttle (2.1 / 2.2) ----------------------------------
+    // Set when a gap triggers a ResendRequest, cleared when a message finally
+    // arrives at the expected sequence (or on disconnect/reset/logon). Stops
+    // one ResendRequest per out-of-sequence message from flooding the peer.
+    std::atomic<bool> gap_open_{false};
+
+    // Corrupt stored frames skipped during a ResendRequest replay (2.2).
+    std::atomic<std::uint64_t> resend_corrupt_{0};
 
     // -- Heartbeat interval mirror (F2) -------------------------------------
     // cfg_.heartbeat_interval is written by the IO thread (handle_logon) and
@@ -185,28 +243,93 @@ private:
     void handle_heartbeat(const Message &msg);
     void handle_test_request(const Message &msg);
     void handle_resend_request(const Message &msg);
-    void handle_sequence_reset(const Message &msg);
+    // Returns true when the SequenceReset was consumed (applied or safely
+    // ignored): process_message then returns WITHOUT advancing/storing the
+    // sequence number. Returns false when it must be dropped as unrecoverable
+    // (a gap-fill referencing a future sequence — a ResendRequest was issued).
+    bool handle_sequence_reset(const Message &msg);
     void handle_reject(const Message &msg);
 
     // -- Internal send helpers -----------------------------------------------
     void send_logon();
     void send_logout(std::string_view reason);
+    // Echo Logout for a peer-initiated logout: sends the message WITHOUT
+    // entering LogoutSent, so the caller can go straight to Disconnected.
+    void send_logout_echo();
     void send_heartbeat(std::string_view test_req_id = "");
     void send_test_request();
     void send_resend_request(SeqNum begin, SeqNum end);
     void send_sequence_reset(SeqNum new_seq, bool gap_fill);
     void send_reject(SeqNum ref_seq, SessionRejectReason reason, std::string_view ref_msg_type = "",
                      TagNum ref_tag = 0, std::string_view text = "");
+    // BusinessMessageReject (35=j) for dictionary-validation failures (2.7).
+    // RefMsgType mirrors the rejected message — tag 372 is itself a required
+    // field of 35=j in the builtin dictionary.
+    void send_business_reject(SeqNum ref_seq, int business_reject_reason,
+                              std::string_view ref_msg_type, std::string_view text);
 
-    Result<void> send_message(Message &msg); // internal: sets header, stores, sends
-    std::string build_header_fields(const Message &msg, SeqNum seq);
+    // internal: sets header, stores, sends. Locks send_mutex_ itself.
+    Result<void> send_message(Message &msg);
+    // Same as send_message but the caller ALREADY holds send_mutex_ (used by
+    // the ResendRequest replay so concurrent sends can't interleave).
+    Result<void> send_message_locked(Message &msg);
+    // Emit an already-serialized frame (resend replay): no seq consumption,
+    // no store write. Caller must hold send_mutex_.
+    void emit_wire_locked(std::string_view wire);
 
     // -- Sequence validation -------------------------------------------------
     bool validate_seq_num(const Message &msg);
+    // Gap throttle: sends a ResendRequest at most once per open gap.
+    void request_gap(SeqNum begin);
+
+    // -- State machine (2.4) -------------------------------------------------
+    // compare_exchange transition: returns true only if the session was in
+    // `expected` and moved to `desired`. Use it wherever a user thread, the
+    // IO thread and the timer thread can race; plain stores remain only where
+    // a single-thread context is proven (send_logon's initial state).
+    bool transition(SessionState expected, SessionState desired);
+
+    // -- ResendRequest replay (2.2) -----------------------------------------
+    // Snapshot of store_->get_messages(begin, end): collecting under the
+    // store lock and replaying after releasing it keeps the store lock out of
+    // any send/callback path. nullopt = the store read failed; the caller
+    // must then emit NOTHING rather than gap-fill over messages it could not
+    // read (masking real traffic would be worse than a stalled peer).
+    struct StoredFrame {
+        SeqNum seq;
+        std::string wire;
+    };
+    [[nodiscard]] std::optional<std::vector<StoredFrame>> snapshot_store(SeqNum begin, SeqNum end);
+
+    // -- Exception boundary (2.6) -------------------------------------------
+    // Runs a user-callback invocation; any exception (std or not) is funnelled
+    // to report() so it can never escape into the IO/timer thread.
+    template <typename Fn>
+    void guarded(Fn &&fn) {
+        try {
+            fn();
+        } catch (const std::exception &e) {
+            report(e.what());
+        } catch (...) {
+            report("unknown exception from session callback");
+        }
+    }
+    // Routes to SessionCallbacks::on_error; swallows when unset (no logging
+    // infra exists — that is the documented floor, see SessionCallbacks).
+    void report(std::string_view what) noexcept;
+
+    // -- Dictionary validation (2.7) ----------------------------------------
+    // Resolves the DataDictionary for this session's version: the explicitly
+    // provided dict first, else the process-wide registry the engine
+    // populates via Engine::load_*_dictionary(). May return nullptr (no
+    // validation then).
+    [[nodiscard]] const DataDictionary *resolve_dictionary() const;
 
     // -- Helpers -------------------------------------------------------------
     bool is_admin_msg(std::string_view msg_type) const noexcept;
     std::string sending_time_str() const;
+    // Current time through the (possibly virtual) clock.
+    [[nodiscard]] Millis clock_now() const;
 };
 
 } // namespace fix

@@ -35,9 +35,14 @@ struct EngineConfig {
     std::size_t thread_pool_size = 4;
 
     // Engine-level transport error sink. Every transport error (bind/connect/
-    // recv/send failures, poll errors) that used to be discarded fires this.
-    // Called on the transport's IO thread (or the caller's, for start-up
-    // errors) – keep it fast and thread-safe.
+    // recv/send failures, poll errors) that used to be discarded fires this,
+    // as do transport send failures surfaced from Session's do_send wiring and
+    // the exception-backstop reports for exceptions escaping user/session
+    // callbacks on the engine's timer, transport-IO and shutdown threads
+    // (fix::ErrorCode::SessionError). Called on the transport's IO thread (or
+    // the caller's, for start-up errors / synchronous sends) – keep it fast
+    // and thread-safe, do not re-enter the Engine/session it came from, and
+    // never throw out of it (throws are swallowed by the backstop).
     std::function<void(std::error_code)> on_error;
 };
 
