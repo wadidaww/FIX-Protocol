@@ -69,14 +69,14 @@ ITransport (TcpTransport)  ← 1 thread per transport, epoll ET (Linux) / busy-p
 
 ### Transmit path
 1. `Session::send()` → `send_message()` — `session.cpp:428-446`: under `send_mutex_`: assign seq → `builder_.serialize(msg,…)` → `store_outbound` (**Result discarded**) → `cbs_.do_send(wire)`.
-2. `MessageBuilder` — `serializer.cpp:21-79`: `begin()` emits `35=` first, forced header `49,56,34,52`, appends other fields in stored order minus skip-list, `finish()` computes BodyLength (`= body.size()`) + CheckSum (mod-256 over `8=…9=N\x01body`).
+2. `MessageBuilder` — `serializer.cpp:21-79`: `begin()` emits `35=` first, forced header `49,56,34,[43],[122],52` (43 `PossDupFlag` / 122 `OrigSendingTime` in header position when present — F5), appends other fields in stored order minus skip-list, `finish()` computes BodyLength (`= body.size()`) + CheckSum (mod-256 over `8=…9=N\x01body`).
 3. `TcpTransport::send()` — direct `::send()` if connected, else queue under `send_mutex_`.
 
 ### Threads
 | Thread | Entry points |
 |---|---|
 | App/user | `Session::send/logon/logout/disconnect/reset`, `Engine::add/remove_session` |
-| Engine timer (200 ms) | `SessionManager::tick_all` → `Session::on_timer` (heartbeats, timeouts, user cb) |
+| Engine timer (200 ms) | `Engine` timer loop → `Session::on_timer` (heartbeats, timeouts, gap retry, user cb). `SessionManager::tick_all` was deleted as dead code (F10) |
 | Transport IO (1/transport) | `Session::on_data` → full admin/app dispatch, replies, user callbacks |
 | `Engine::stop()` / dtor | `logout()` via `for_each` |
 
@@ -165,7 +165,7 @@ A single `Session` is touched by ≥3 threads. Only outbound path has `send_mute
 - All `Result<void>` returns discarded: `store_outbound` (`session.cpp:437`) — seq incremented even on failure → permanent desync; `send_message` **always returns `{}`**; `do_send` is `void` → transport errors unreportable. FileStore dtor `catch(...){}`.
 
 ### Dictionary
-- Validation **never invoked**: `Session::dict_` stored then never read; `SessionConfig::validate_fields` dead; `DataDictionary::validate()` has zero call sites → malformed orders passed straight to app.
+- Validation **never invoked** *(at audit time)*: `Session::dict_` stored then never read; `SessionConfig::validate_fields` dead; `DataDictionary::validate()` has zero call sites → malformed orders passed straight to app. Wired in Phase 2 task 2.7 — since F8 it defaults to **OFF** and must be opted into.
 - Coverage: **66 fields** (of ~1,000+), **15 message types** (of ~80+ in 4.2 alone), zero repeating-group definitions. FIX 4.4 = `load_builtin_messages_42()` relabeled; FIX 5.0SP2 = 4.4 + `ApplVerID` field. FIXT 1.1 gets 5.0 content.
 - Enum tables wrong: `TimeInForce` missing 4.4 A/B/C/D; `OrdStatus`/`ExecType` mismatched per version; `Side` includes invalid `9`; `CheckSum` typed String.
 - Fields referenced by message defs (HandlInst 21, ExecInst 18, RawData 96…) never defined in `load_builtin_fields`.
@@ -206,7 +206,7 @@ A single `Session` is touched by ≥3 threads. Only outbound path has `send_mute
 ### Error handling
 - Exceptions swallowed silently (`session.cpp:55-59` empty catch); no `on_error` wiring; no exception boundary at timer/transport/`stop()` entry points.
 - `std::filesystem::create_directories` unwrapped in log/store ctors → throw at construction → `std::terminate`.
-- Dead/ignored config: `reconnect_delay` (hardcoded 5 s), `reset_seq_num`, `validate_fields`, `logout_timeout`, `reset_on_disconnect`, `send_buffer_size`; `build_header_fields` declared never defined.
+- Dead/ignored config *(at audit time)*: `reconnect_delay` (hardcoded 5 s), `reset_seq_num`, `validate_fields`, `logout_timeout`, `reset_on_disconnect`, `send_buffer_size`; `build_header_fields` declared never defined. Several are live since Phase 2: `validate_fields` (opt-in, F8), `logout_timeout`, `reset_on_logon` (applies `store->reset()` before numbering, F1).
 
 ---
 

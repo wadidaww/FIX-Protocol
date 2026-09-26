@@ -74,13 +74,13 @@ truncated, injection) green under ASan/UBSan; injection + hijack tests fail-to-p
 
 | ID | Task | Ref |
 |---|---|---|
-| 2.1 | Sequence handling: `NextTargetMsgSeqNum = received+1`; special-case `MsgType=4` **before** seq validation (both modes, gap-fill rules: PossDup required, `NewSeqNo > expected`); stop incrementing after SequenceReset; `send_sequence_reset` reachable | SeqReset |
-| 2.2 | Resend: under `send_mutex_`; GapFill admin messages (`SequenceReset GapFillFlag=Y PossDupFlag=Y`); re-tag app messages `PossDupFlag=Y` + `OrigSendingTime`; read store → release lock → send; reject `BeginSeqNo > NextSender`; `gap_open_` throttle flag | Resend |
+| 2.1 | Sequence handling: `NextTargetMsgSeqNum = received+1`; special-case `MsgType=4` **before** seq validation (both modes, gap-fill rules: PossDup required, `NewSeqNo > expected`); stop incrementing after SequenceReset; outbound gap-fill/reset frames are built inline during replay — the never-called `send_sequence_reset` helper was deleted instead of "made reachable" (F10), as was `SessionManager::tick_all` | SeqReset |
+| 2.2 | Resend: under `send_mutex_`; GapFill admin messages (`SequenceReset GapFillFlag=Y PossDupFlag=Y`); re-tag app messages `PossDupFlag=Y` + `OrigSendingTime`; read store → release lock → send; reject `BeginSeqNo > NextSender` **and** `BeginSeqNo < 1` (F4); `gap_open_` throttle flag; retry the request every `1.2×HeartBtInt` while the gap is open and give up loudly after `kMaxGapRetries` (F9) | Resend |
 | 2.3 | Timers: `test_request_sent_time_`; disconnect at `≥ 1.2×HeartBtInt` after TestRequest; clear `test_req_pending_` on **any** inbound; implement Logout timeout (`logout_timeout`) with heartbeats continuing in LogoutSent; validate `HeartBtInt > 0` (reject/ignore otherwise) | Timer bugs |
 | 2.4 | FSM: CAS `transition(from,to)` helper; state gates on `send()`/`logout()`; duplicate Logon → Logout + disconnect; delete dead `LogoutReceived`; wire `Reconnecting` or remove | FSM |
 | 2.5 | Reject handling: implement `handle_reject` (terminate handshake on rejected Logon, surface callback); consume seq + valid `RefSeqNum` when rejecting missing MsgType | `handle_reject` |
 | 2.6 | Error propagation: `do_send` → `Result<void>`; check `store_outbound` **before** incrementing seq; `Session::send` returns real error; exception boundaries at `on_timer`/transport/`stop()`; replace silent catch with `on_error` callback + counter; advance seq **before** dispatch (scope guard) so throwing user cb can't cause resend storms | Store/errors |
-| 2.7 | Dictionary validation wired: call `dict_->validate()` on inbound app messages when `validate_fields` (default ON for app msgs), emit session Reject / BusinessMessageReject appropriately | Dict dead |
+| 2.7 | Dictionary validation wired: call `dict_->validate()` on inbound app messages when `validate_fields` — **default OFF / opt-in** (F8: `HandlInst` is required by our FIX 4.2 dictionary yet optional in FIX 4.4+, so default-on bounced cross-version traffic); emit BusinessMessageReject with `BusinessRejectReason=0` ("Other") + detail in `Text` (F11), session Reject for protocol violations | Dict dead |
 | 2.8 | `handle_logon`: validate `ResetSeqNumFlag` gating (logon states only), require HeartBtInt, echo-check initiator | Logon |
 
 **Exit criteria**: protocol scenario tests green: gap→ResendRequest→GapFill

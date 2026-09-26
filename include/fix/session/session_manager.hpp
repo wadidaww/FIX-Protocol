@@ -40,9 +40,6 @@ public:
     // Iterate
     void for_each(std::function<void(Session &)> fn);
 
-    // Broadcast timer ticks to all sessions
-    void tick_all();
-
     [[nodiscard]] std::size_t count() const noexcept;
 
 private:

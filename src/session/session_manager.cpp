@@ -67,10 +67,6 @@ void SessionManager::for_each(std::function<void(Session &)> fn) {
         fn(*sess);
 }
 
-void SessionManager::tick_all() {
-    for_each([](Session &s) { s.on_timer(); });
-}
-
 std::size_t SessionManager::count() const noexcept {
     std::shared_lock lock(mutex_);
     return sessions_.size();

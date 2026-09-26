@@ -517,8 +517,15 @@ TEST(SessionTest, SerializationFailureDoesNotBurnSenderSequence) {
 
 // ---------------------------------------------------------------------------
 // F7 regression: the duplicate-header Reject must fire in ANY state — a
-// dup-header Logon received in WaitingLogon is rejected (reason 13), the
-// session does NOT go Active, and no sequence number is consumed.
+// dup-header Logon received in WaitingLogon is rejected (reason 13) and the
+// session does NOT go Active.
+//
+// F3: the Reject DOES consume the sequence (same gate as the dispatch
+// advance — `seq_validated || !poss_dup`, shared via consume_inbound). The
+// pre-F3 variant refused to consume anything in a logon state, so a session
+// that rejected a message kept awaiting the exact same MsgSeqNum forever.
+// Session-level Rejects are the response to that message: it is answered and
+// taken, exactly like an accepted copy of it would be.
 // ---------------------------------------------------------------------------
 TEST(SessionTest, DuplicateHeaderLogon_RejectedWhileWaitingLogon) {
     std::vector<std::string> sent;
@@ -572,8 +579,11 @@ TEST(SessionTest, DuplicateHeaderLogon_RejectedWhileWaitingLogon) {
     EXPECT_TRUE(found_reject) << "dup-header Reject must fire in logon states too (F7)";
     EXPECT_EQ(sess.state(), SessionState::WaitingLogon) << "dup-header Logon must not activate";
     EXPECT_FALSE(logon_called);
-    // In logon states sequence validation never ran → no consumption (F7).
-    EXPECT_EQ(sess.store()->next_target_seq_num(), target_before);
+    // F3: the Reject consumes the rejected message's slot (shared gate with
+    // the dispatch advance), so the session is NOT left awaiting seq 1 it has
+    // already answered.
+    EXPECT_EQ(sess.store()->next_target_seq_num(), target_before + 1)
+        << "a session-level Reject must consume the sequence (F3)";
 }
 
 // ===========================================================================
@@ -1253,7 +1263,13 @@ TEST(SessionTest, DictionaryValidationRejectsBadAppMessage) {
     };
 
     auto store = std::make_unique<MemoryStore>();
-    Session sess(make_cfg(false), std::move(store), dict.get(), cbs);
+    // F8: validate_fields now defaults to OFF (HandlInst is marked required
+    // by our FIX 4.2 dictionary yet is officially optional in FIX 4.4+, so a
+    // default-on flag bounced legitimate cross-version traffic). Tests that
+    // exercise 2.7 must opt in explicitly — this is that test.
+    SessionConfig cfg = make_cfg(false);
+    cfg.validate_fields = true;
+    Session sess(cfg, std::move(store), dict.get(), cbs);
     handshake_acceptor(sess); // admin messages bypass validation
     ASSERT_EQ(sess.state(), SessionState::Active);
     const std::size_t sends_after_handshake = sent.size();
@@ -1267,7 +1283,10 @@ TEST(SessionTest, DictionaryValidationRejectsBadAppMessage) {
     ASSERT_TRUE(parse_frame(sent.back(), m));
     EXPECT_EQ(m.msg_type(), msg_types::BusinessMessageReject);
     EXPECT_EQ(field_of(m, tags::RefSeqNum), "2");
-    EXPECT_EQ(field_of(m, tags::BusinessRejectReason), "5"); // Business Reject
+    // F11: BusinessRejectReason 0 = "Other" (the specifics live in 58).
+    // The old assertion pinned 5, which the FIX tables define as "Duplicate"
+    // — a wrong reason, not a generic "Business Reject".
+    EXPECT_EQ(field_of(m, tags::BusinessRejectReason), "0"); // Other
     EXPECT_EQ(field_of(m, tags::RefMsgType), msg_types::NewOrderSingle);
     EXPECT_FALSE(field_of(m, tags::Text).empty()) << "35=j must say what failed";
     EXPECT_EQ(dispatched, 0) << "an invalid message must not reach the application";
@@ -1457,4 +1476,492 @@ TEST(SessionTest, PeerHeartBtIntAdoptionDrivesTimer) {
     EXPECT_EQ(sent.size(), before + 2u);
     EXPECT_EQ(count_msg_type(sent, msg_types::Heartbeat), 1u);
     EXPECT_EQ(count_msg_type(sent, msg_types::TestRequest), 1u);
+}
+
+// ===========================================================================
+// Phase-3 review round (F1-F12): one named regression per finding. The
+// comments state what the pre-review implementation did wrong so a future
+// regression fails as a named test instead of drifting silently.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// F1: ResetSeqNumFlag (141=Y) on OUR outbound Logon must rewind the store
+// BEFORE the frame is numbered. The old code only tagged the Logon, so a
+// pre-advanced store emitted "34=500" and the peer's very next seq-1 message
+// was answered "MsgSeqNum too low" — the handshake wedged forever.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, ResetOnLogonRewindsStoreBeforeNumberingTheLogon) {
+    std::vector<std::string> sent;
+    int logon_calls = 0;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.on_logon = [&](const SessionID &) {
+        ++logon_calls;
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    MemoryStore *raw = store.get();
+    for (SeqNum i = 1; i < 500; ++i) // next_sender -> 500
+        raw->incr_sender_seq_num();
+    raw->set_next_target_seq_num(500);
+
+    SessionConfig cfg = make_cfg(/*initiator=*/true);
+    cfg.reset_on_logon = true;
+    Session sess(cfg, std::move(store), nullptr, cbs);
+
+    ASSERT_TRUE(sess.logon().has_value());
+    ASSERT_EQ(sent.size(), 1u);
+    Message m;
+    ASSERT_TRUE(parse_frame(sent[0], m));
+    EXPECT_EQ(m.msg_type(), msg_types::Logon);
+    EXPECT_EQ(field_of(m, tags::ResetSeqNumFlag), "Y");
+    EXPECT_EQ(field_of(m, tags::MsgSeqNum), "1") << "141=Y must renumber the Logon itself (F1)";
+    EXPECT_EQ(raw->next_sender_seq_num(), 2u) << "the reset baseline must survive the send";
+    EXPECT_EQ(raw->next_target_seq_num(), 1u);
+    EXPECT_EQ(sess.state(), SessionState::LogonSent);
+
+    // The acceptor answers from ITS fresh baseline. Pre-fix our expectation
+    // was still 500, so seq 1 read as 499 messages too low -> Logout.
+    feed_logon(sess, 1);
+    EXPECT_EQ(sess.state(), SessionState::Active) << "peer's seq-1 Logon must be accepted (F1)";
+    EXPECT_EQ(logon_calls, 1);
+    EXPECT_EQ(raw->next_target_seq_num(), 2u);
+}
+
+// ---------------------------------------------------------------------------
+// F3: the duplicate-header Reject and the dispatch advance share ONE gate
+// (consume_inbound). In Active state an in-sequence dup-header message is
+// rejected AND consumed; the old code rejected without consuming, so the
+// peer's next correct message looked like a permanent gap — re-request,
+// re-send, re-reject loop.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, ActiveInSequenceDuplicateHeaderRejectConsumesSequence) {
+    std::vector<std::string> sent;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs);
+    handshake_acceptor(sess);
+    ASSERT_EQ(sess.state(), SessionState::Active);
+    ASSERT_EQ(sess.store()->next_target_seq_num(), 2u);
+
+    // Heartbeat at the EXPECTED seq carrying a duplicated SenderCompID.
+    MessageBuilder b;
+    b.begin("FIX.4.2", msg_types::Heartbeat);
+    b.add(tags::SenderCompID, "CLIENT");
+    b.add(tags::SenderCompID, "CLIENT"); // duplicate standard-header tag
+    b.add(tags::TargetCompID, "SERVER");
+    b.add(tags::MsgSeqNum, std::int64_t(2));
+    b.add(tags::SendingTime, "20240101-12:00:00.000");
+    const std::string wire = b.finish();
+    ASSERT_FALSE(wire.empty());
+    feed_wire(sess, wire);
+
+    EXPECT_EQ(count_msg_type(sent, msg_types::Reject), 1u);
+    EXPECT_EQ(sess.store()->next_target_seq_num(), 3u)
+        << "a session-level Reject must consume the slot it answered (F3)";
+    EXPECT_EQ(sess.state(), SessionState::Active);
+
+    // The decisive assertion: the peer's NEXT message is in sequence. Pre-fix
+    // the target was still 2, so seq 3 opened a gap and a ResendRequest.
+    const std::size_t frames_before = sent.size();
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::Heartbeat, 3, "CLIENT", "SERVER"));
+    EXPECT_EQ(count_msg_type(sent, msg_types::ResendRequest), 0u)
+        << "no phantom gap after a rejected-but-consumed message (F3)";
+    EXPECT_EQ(sent.size(), frames_before) << "no reply is due for an in-sequence Heartbeat";
+    EXPECT_EQ(sess.store()->next_target_seq_num(), 4u);
+}
+
+// ---------------------------------------------------------------------------
+// F4: BeginSeqNo is 1-based. A stray BeginSeqNo=0 used to slip past the
+// `begin > range_end` guard and drive the replay cursor to 0, emitting
+// gap-fill frames with 34=0 — an impossible MsgSeqNum.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, ResendRequestWithZeroBeginSeqNoRejected) {
+    std::vector<std::string> sent;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs);
+    handshake_acceptor(sess); // next_sender == 3
+    ASSERT_EQ(sess.store()->next_sender_seq_num(), 3u);
+
+    const std::size_t before = sent.size();
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::ResendRequest, 2, "CLIENT", "SERVER",
+                              {{tags::BeginSeqNo, "0"}, {tags::EndSeqNo, "0"}}));
+
+    ASSERT_EQ(sent.size(), before + 1u) << "exactly one Reject, no replay";
+    Message m;
+    ASSERT_TRUE(parse_frame(sent[before], m));
+    EXPECT_EQ(m.msg_type(), msg_types::Reject);
+    EXPECT_EQ(field_of(m, tags::RefSeqNum), "2");
+    EXPECT_EQ(field_of(m, tags::SessionRejectReason), "5"); // ValueIncorrect
+    EXPECT_EQ(field_of(m, tags::RefMsgType), msg_types::ResendRequest);
+    EXPECT_EQ(field_of(m, tags::RefTagID), "7"); // BeginSeqNo
+    EXPECT_EQ(count_msg_type(sent, msg_types::SequenceReset), 0u)
+        << "a cursor of 0 must never reach gap-fill emission (F4)";
+    EXPECT_EQ(sess.state(), SessionState::Active);
+}
+
+// ---------------------------------------------------------------------------
+// F6: the handshake state must be published BEFORE send_message(). do_send
+// can loop a peer's answer back into this session faster than logon()
+// returns; the old order left handle_logon reading NotConnected/Disconnected
+// and dropping the Logon ("stale Logon — ignore"), after which the timer
+// waited out logon_timeout on a session that had already exchanged Logons.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, LogonResponseDuringSendLoopbackActivatesSession) {
+    std::vector<std::string> sent;
+    int logon_calls = 0;
+    Session *sess_ptr = nullptr; // bound after construction, captured by ref
+    bool feed_answer = false;
+
+    SessionCallbacks cbs;
+    cbs.on_logon = [&](const SessionID &) {
+        ++logon_calls;
+    };
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+        if (feed_answer) {
+            // Loopback: the acceptor's reply arrives while our own Logon is
+            // still inside send_logon().
+            feed_answer = false;
+            std::string answer = make_wire("FIX.4.2", msg_types::Logon, 1, "CLIENT", "SERVER",
+                                           {{tags::EncryptMethod, "0"}, {tags::HeartBtInt, "30"}});
+            sess_ptr->on_data(answer.data(), answer.size());
+        }
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(/*initiator=*/true), std::move(store), nullptr, cbs);
+    sess_ptr = &sess;
+
+    feed_answer = true;
+    ASSERT_TRUE(sess.logon().has_value());
+    EXPECT_EQ(sess.state(), SessionState::Active)
+        << "the loopback answer must activate the session, not be dropped (F6)";
+    EXPECT_EQ(logon_calls, 1) << "on_logon must fire exactly once (F6)";
+    ASSERT_EQ(sent.size(), 1u) << "our Logon only; the answer arrives inbound";
+    Message m;
+    ASSERT_TRUE(parse_frame(sent[0], m));
+    EXPECT_EQ(m.msg_type(), msg_types::Logon);
+    EXPECT_EQ(field_of(m, tags::MsgSeqNum), "1");
+}
+
+// ---------------------------------------------------------------------------
+// F6: a Logon that never reached the wire must leave the FSM retryable.
+// The old code published LogonSent/WaitingLogon unconditionally, so a store
+// failure parked the session in a handshake state with no Logon on the wire.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, LogonSendFailureLeavesSessionRetryable) {
+    std::vector<std::string> sent;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+
+    auto store = std::make_unique<FlakyStore>();
+    FlakyStore *flaky = store.get();
+    flaky->fail_outbound = true;
+
+    Session sess(make_cfg(/*initiator=*/true), std::move(store), nullptr, cbs);
+    auto r = sess.logon();
+    ASSERT_FALSE(r.has_value()) << "logon() must surface a failed Logon send (F6)";
+    EXPECT_EQ(r.error(), make_error_code(ErrorCode::StoreError));
+    EXPECT_TRUE(sent.empty()) << "no Logon may reach the wire";
+    EXPECT_EQ(sess.state(), SessionState::NotConnected)
+        << "a failed Logon must not leave the FSM stuck in LogonSent (F6)";
+
+    // Retryable from the pre-logon state once the store recovers.
+    flaky->fail_outbound = false;
+    ASSERT_TRUE(sess.logon().has_value());
+    EXPECT_EQ(sess.state(), SessionState::LogonSent);
+    EXPECT_EQ(sent.size(), 1u);
+}
+
+// ---------------------------------------------------------------------------
+// F6: on_logon may only fire for a handshake that actually completed. An
+// acceptor whose Logon response failed to send used to report success anyway.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, AcceptorLogonSendFailureSuppressesOnLogon) {
+    std::vector<std::string> sent;
+    int logon_calls = 0;
+    std::string last_error;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.on_logon = [&](const SessionID &) {
+        ++logon_calls;
+    };
+    cbs.on_error = [&](const SessionID &, std::string_view what) {
+        last_error.assign(what.data(), what.size());
+    };
+
+    auto store = std::make_unique<FlakyStore>();
+    FlakyStore *flaky = store.get();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs);
+    ASSERT_TRUE(sess.logon().has_value());
+    ASSERT_EQ(sess.state(), SessionState::WaitingLogon);
+
+    flaky->fail_outbound = true; // the response Logon cannot be persisted
+    feed_logon(sess, 1);
+
+    EXPECT_EQ(logon_calls, 0) << "on_logon must be suppressed for a failed handshake (F6)";
+    EXPECT_EQ(sess.state(), SessionState::WaitingLogon);
+    EXPECT_NE(last_error.find("logon race"), std::string::npos)
+        << "the failure must surface on on_error, got: " << last_error;
+    EXPECT_GE(sess.error_count(), 1u);
+}
+
+// ---------------------------------------------------------------------------
+// F8: dictionary validation of inbound app messages is opt-in. HandlInst is
+// marked required by our FIX 4.2 dictionary yet is optional in FIX 4.4+, so
+// the old default-on flag bounced legitimate cross-version traffic.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, ValidateFieldsDefaultsToOff) {
+    SessionConfig cfg;
+    EXPECT_FALSE(cfg.validate_fields)
+        << "2.7 validation must be opt-in (F8); DictionaryValidationRejectsBadAppMessage opts in";
+}
+
+// ---------------------------------------------------------------------------
+// F9: an open gap must not rely on the single ResendRequest request_gap()
+// fired. Re-arm every 1.2xHeartBtInt while the gap stays open, then give up
+// loudly after kMaxGapRetries total attempts instead of hanging as a zombie
+// Active session with exactly one request ever sent.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, GapRetriesUpToBudgetThenDisconnects) {
+    std::vector<std::string> sent;
+    int gap_events = 0;
+    bool disconnect_called = false;
+    std::string last_error;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.on_sequence_gap = [&](const SessionID &, SeqNum, SeqNum) {
+        ++gap_events;
+    };
+    cbs.do_disconnect = [&]() {
+        disconnect_called = true;
+    };
+    cbs.on_error = [&](const SessionID &, std::string_view what) {
+        last_error.assign(what.data(), what.size());
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs); // hb = 30 s
+
+    Session::Millis fake = 0;
+    sess.set_time_source_for_test([&fake] { return fake; });
+    handshake_acceptor(sess);
+    ASSERT_EQ(sess.state(), SessionState::Active);
+    ASSERT_EQ(sess.store()->next_target_seq_num(), 2u);
+
+    // Open a gap: attempt #1 goes out immediately (attempt 1 of kMaxGapRetries).
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::Heartbeat, 3, "CLIENT", "SERVER"));
+    ASSERT_EQ(count_msg_type(sent, msg_types::ResendRequest), 1u);
+
+    // Before the 1.2x spacing elapses there is no re-arm: the spacing IS the
+    // anti-flood guarantee (1 heartbeat = 30 s < 36 s retry interval).
+    fake = 30'000;
+    sess.on_timer();
+    EXPECT_EQ(count_msg_type(sent, msg_types::ResendRequest), 1u)
+        << "no retry inside the 1.2xHeartBtInt spacing (F9)";
+    EXPECT_EQ(sess.state(), SessionState::Active);
+
+    // Each full spacing re-arms; the peer is kept alive with an out-of-seq
+    // Heartbeat (still > expected, so it neither closes nor restarts the gap).
+    const int kMaxGapRetries = 5;
+    for (int cycle = 1; cycle < kMaxGapRetries; ++cycle) { // attempts 2..5
+        feed_wire(sess, make_wire("FIX.4.2", msg_types::Heartbeat, 3, "CLIENT", "SERVER"));
+        fake += 36'000; // 1.2 x 30 s
+        sess.on_timer();
+        ASSERT_EQ(count_msg_type(sent, msg_types::ResendRequest),
+                  static_cast<std::size_t>(cycle + 1))
+            << "cycle " << cycle << " must re-arm exactly one ResendRequest (F9)";
+        ASSERT_EQ(sess.state(), SessionState::Active) << "budget not exhausted yet";
+    }
+    ASSERT_EQ(count_msg_type(sent, msg_types::ResendRequest), 5u) << "initial + 4 retries";
+    EXPECT_EQ(gap_events, 5) << "every out-of-seq feed reports a gap, requests stay throttled";
+
+    // Attempt 6 exceeds the budget: report + disconnect instead of hanging.
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::Heartbeat, 3, "CLIENT", "SERVER"));
+    fake += 36'000;
+    sess.on_timer();
+    EXPECT_EQ(count_msg_type(sent, msg_types::ResendRequest), 5u) << "no 6th request is sent";
+    EXPECT_EQ(sess.state(), SessionState::Disconnected);
+    EXPECT_TRUE(disconnect_called);
+    EXPECT_GE(sess.error_count(), 1u);
+    EXPECT_NE(last_error.find("kMaxGapRetries"), std::string::npos)
+        << "budget exhaustion must be loud, got: " << last_error;
+
+    // Every retry addressed the still-open range (BeginSeqNo = expected seq).
+    int checked = 0;
+    for (const auto &w : sent) {
+        Message m;
+        if (parse_frame(w, m) && m.msg_type() == msg_types::ResendRequest) {
+            EXPECT_EQ(field_of(m, tags::BeginSeqNo), "2");
+            EXPECT_EQ(field_of(m, tags::EndSeqNo), "0");
+            ++checked;
+        }
+    }
+    EXPECT_EQ(checked, 5);
+}
+
+// ---------------------------------------------------------------------------
+// F12: RefSeqNum (45) is MANDATORY on a session Reject — 0 when the reference
+// sequence is unknown. The old `if (ref_seq > 0)` omitted the tag entirely for
+// a message with no usable MsgSeqNum.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, MissingMsgSeqNumRejectCarriesRefSeqNumZero) {
+    std::vector<std::string> sent;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs);
+    handshake_acceptor(sess);
+    ASSERT_EQ(sess.state(), SessionState::Active);
+    ASSERT_EQ(sess.store()->next_target_seq_num(), 2u);
+
+    // Well-framed message with NO MsgSeqNum (34) at all.
+    std::string body;
+    body += std::string("35=0") + SOH;
+    body += std::string("49=CLIENT") + SOH;
+    body += std::string("56=SERVER") + SOH;
+    body += std::string("52=20240101-12:00:00.000") + SOH;
+    feed_wire(sess, MessageBuilder::build("FIX.4.2", body));
+
+    ASSERT_EQ(count_msg_type(sent, msg_types::Reject), 1u);
+    Message m;
+    for (const auto &w : sent) {
+        if (parse_frame(w, m) && m.msg_type() == msg_types::Reject)
+            break;
+    }
+    EXPECT_EQ(field_of(m, tags::RefSeqNum), "0")
+        << "45 must be present (0 = unknown), never omitted (F12)";
+    EXPECT_EQ(field_of(m, tags::SessionRejectReason), "1"); // RequiredTagMissing
+    EXPECT_EQ(field_of(m, tags::RefTagID), "34");           // MsgSeqNum
+    // Nothing validated → nothing consumed: the sequence state is untouched.
+    EXPECT_EQ(sess.store()->next_target_seq_num(), 2u);
+    EXPECT_EQ(sess.state(), SessionState::Active);
+}
+
+// ---------------------------------------------------------------------------
+// F5: 43 (PossDupFlag) and 122 (OrigSendingTime) are standard HEADER tags but
+// used to be emitted from the body loop, i.e. after 52 SendingTime, on every
+// resend replay. Header emission order is 34, 43, 122, 52 — asserted on the
+// raw bytes, not through the parser (which would hide the order).
+// ---------------------------------------------------------------------------
+TEST(SessionTest, ResendReplayEmitsHeaderTagsInStandardOrder) {
+    std::vector<std::string> sent;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs);
+    handshake_acceptor(sess); // stores 1=Logon, 2=Logon
+
+    Message order(msg_types::NewOrderSingle);
+    order.set(tags::ClOrdID, "ORD-HDR");
+    ASSERT_TRUE(sess.send(order).has_value());
+    Message stored;
+    ASSERT_TRUE(parse_frame(sent.back(), stored));
+    ASSERT_FALSE(field_of(stored, tags::SendingTime).empty());
+
+    const std::size_t before = sent.size();
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::ResendRequest, 2, "CLIENT", "SERVER",
+                              {{tags::BeginSeqNo, "1"}, {tags::EndSeqNo, "0"}}));
+    ASSERT_GT(sent.size(), before + 1u);
+
+    const auto pos = [](const std::string &frame, std::string_view tag) {
+        return frame.find(std::string(1, SOH) + std::string(tag) + "=");
+    };
+
+    // 1) leading gap-fill: 43 present, no 122, order 34 < 43 < 52.
+    {
+        const std::string &frame = sent[before];
+        const auto i34 = pos(frame, "34");
+        const auto i43 = pos(frame, "43");
+        const auto i52 = pos(frame, "52");
+        ASSERT_NE(i34, std::string::npos);
+        ASSERT_NE(i43, std::string::npos);
+        ASSERT_NE(i52, std::string::npos);
+        EXPECT_LT(i34, i43);
+        EXPECT_LT(i43, i52);
+        EXPECT_EQ(pos(frame, "122"), std::string::npos) << "no OrigSendingTime on a gap-fill";
+    }
+
+    // 2) re-tagged app message: 43 AND 122 present, both before 52.
+    {
+        const std::string &frame = sent[before + 1];
+        const auto i34 = pos(frame, "34");
+        const auto i43 = pos(frame, "43");
+        const auto i122 = pos(frame, "122");
+        const auto i52 = pos(frame, "52");
+        ASSERT_NE(i34, std::string::npos);
+        ASSERT_NE(i43, std::string::npos);
+        ASSERT_NE(i122, std::string::npos);
+        ASSERT_NE(i52, std::string::npos);
+        EXPECT_LT(i34, i43) << "34 precedes 43 (F5)";
+        EXPECT_LT(i43, i122) << "43 precedes 122 (F5)";
+        EXPECT_LT(i122, i52) << "122 must NOT trail 52 (F5)";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F2: a peer-initiated Logout must actually TEAR DOWN the connection. The old
+// peer branch only stored Disconnected — on_timer has no work for that state
+// and do_disconnect never ran, so the transport FD (and the accept loop for a
+// raw peer) stayed pinned forever: state said "disconnected", the socket did
+// not.
+// ---------------------------------------------------------------------------
+TEST(SessionTest, PeerInitiatedLogoutClosesConnection) {
+    std::vector<std::string> sent;
+    int logout_calls = 0;
+    bool disconnect_called = false;
+    std::string logout_reason;
+
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.on_logon = [&](const SessionID &) {
+    };
+    cbs.on_logout = [&](const SessionID &, std::string_view reason) {
+        ++logout_calls;
+        logout_reason.assign(reason.data(), reason.size());
+    };
+    cbs.do_disconnect = [&]() {
+        disconnect_called = true;
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs);
+    handshake_acceptor(sess);
+    ASSERT_EQ(sess.state(), SessionState::Active);
+
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::Logout, 2, "CLIENT", "SERVER",
+                              {{tags::Text, "Goodbye"}}));
+
+    EXPECT_EQ(sess.state(), SessionState::Disconnected);
+    EXPECT_TRUE(disconnect_called)
+        << "the transport must be dropped on a peer-initiated Logout (F2)";
+    EXPECT_EQ(count_msg_type(sent, msg_types::Logout), 1u) << "the echo still goes out (F2)";
+    EXPECT_EQ(logout_calls, 1) << "exactly one on_logout, not one per branch (F2)";
+    EXPECT_EQ(logout_reason, std::string("Goodbye"));
 }

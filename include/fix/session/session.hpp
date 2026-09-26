@@ -35,7 +35,14 @@ struct SessionConfig {
     int logout_timeout = 5;      // seconds
     bool reset_on_logon = false;
     bool reset_on_disconnect = false;
-    bool validate_fields = true;
+    // Dictionary validation of inbound APPLICATION messages (2.7).
+    // Default OFF (Phase 2 review decision F8): the builtin tables are
+    // deliberately incomplete (OrdStatus W/X/Y missing, HandlInst still
+    // required on NewOrderSingle), so a default-ON switch silently turned
+    // valid FIX 4.4 traffic into false 35=j rejects. The implementation is
+    // complete and opt-in — set true per session; the default flips back ON
+    // as the Phase 4 exit gate once the tables cover the core-trading set.
+    bool validate_fields = false;
     std::string username;
     std::string password;
     SeqNum reset_seq_num = 0; // 0 = no override
@@ -209,11 +216,32 @@ private:
     std::string pending_test_req_id_;
     std::atomic<bool> test_req_pending_{false};
 
-    // -- Sequence-gap throttle (2.1 / 2.2) ----------------------------------
+    // -- Sequence-gap throttle (2.1 / 2.2 / F9) ------------------------------
     // Set when a gap triggers a ResendRequest, cleared when a message finally
     // arrives at the expected sequence (or on disconnect/reset/logon). Stops
     // one ResendRequest per out-of-sequence message from flooding the peer.
+    // Since F9 it also drives periodic RETRIES from on_timer(): a single-shot
+    // request that went unanswered used to leave a zombie session (Active
+    // forever, exactly one ResendRequest ever sent).
     std::atomic<bool> gap_open_{false};
+    // ResendRequest retry budget for the CURRENT gap (F9): when the last RR
+    // went out (epoch ms, session clock) and how many RRs the gap has already
+    // produced (initial request = 1). Written by the IO thread (request_gap)
+    // and the timer thread (on_timer), so both are atomic.
+    // kMaxGapRetries caps the TOTAL ResendRequests per gap: on the attempt
+    // beyond it the session reports the stall on on_error and disconnects
+    // instead of waiting forever for a peer that is never going to answer.
+    static constexpr int kMaxGapRetries = 5;
+    std::atomic<Millis> gap_rr_last_ms_{0};
+    std::atomic<int> gap_rr_attempts_{0};
+    // Close the current gap: resets the retry budget FIRST, then releases the
+    // throttle. Every site that clears gap_open_ must call this so the next
+    // gap starts a fresh budget instead of inheriting a spent one (F9).
+    void clear_gap() noexcept {
+        gap_rr_attempts_.store(0, std::memory_order_relaxed);
+        gap_rr_last_ms_.store(0, std::memory_order_relaxed);
+        gap_open_.store(false, std::memory_order_release);
+    }
 
     // Corrupt stored frames skipped during a ResendRequest replay (2.2).
     std::atomic<std::uint64_t> resend_corrupt_{0};
@@ -251,7 +279,14 @@ private:
     void handle_reject(const Message &msg);
 
     // -- Internal send helpers -----------------------------------------------
-    void send_logon();
+    // Sends our Logon. Publishes the handshake state (LogonSent for an
+    // initiator, WaitingLogon for an acceptor) BEFORE the frame reaches the
+    // wire and rolls it back if the send fails, so a loopback-fast reply can
+    // never be mistaken for a stale Logon (F6); with reset_on_logon it also
+    // rewinds the store BEFORE sending, so the frame really carries MsgSeqNum
+    // 1 instead of a stale N+1 (F1). Returns the send/store failure to the
+    // caller — logon() and handle_logon both check it.
+    Result<void> send_logon();
     void send_logout(std::string_view reason);
     // Echo Logout for a peer-initiated logout: sends the message WITHOUT
     // entering LogoutSent, so the caller can go straight to Disconnected.
@@ -259,7 +294,9 @@ private:
     void send_heartbeat(std::string_view test_req_id = "");
     void send_test_request();
     void send_resend_request(SeqNum begin, SeqNum end);
-    void send_sequence_reset(SeqNum new_seq, bool gap_fill);
+    // RefSeqNum (45) is MANDATORY on both 35=3 and 35=j — always emitted;
+    // ref_seq 0 means "the offending MsgSeqNum was itself missing/unknown"
+    // and is written as 0 rather than left out (F12).
     void send_reject(SeqNum ref_seq, SessionRejectReason reason, std::string_view ref_msg_type = "",
                      TagNum ref_tag = 0, std::string_view text = "");
     // BusinessMessageReject (35=j) for dictionary-validation failures (2.7).
@@ -279,14 +316,23 @@ private:
 
     // -- Sequence validation -------------------------------------------------
     bool validate_seq_num(const Message &msg);
-    // Gap throttle: sends a ResendRequest at most once per open gap.
+    // Gap throttle: sends a ResendRequest at most once per open gap (the
+    // retry cadence for an unanswered request lives in on_timer — F9).
     void request_gap(SeqNum begin);
+    // The ONE place a processed inbound message consumes its sequence slot.
+    // Shared by the dispatch advance and the session-level Reject paths
+    // (missing MsgType, duplicate header tag): a Reject must consume exactly
+    // what an equivalent accepted message would, otherwise an in-sequence
+    // PossDup with a duplicated header is rejected but never consumed and the
+    // reject/resend loop never ends (F3).
+    void consume_inbound(const Message &msg, bool seq_validated);
 
     // -- State machine (2.4) -------------------------------------------------
     // compare_exchange transition: returns true only if the session was in
     // `expected` and moved to `desired`. Use it wherever a user thread, the
-    // IO thread and the timer thread can race; plain stores remain only where
-    // a single-thread context is proven (send_logon's initial state).
+    // IO thread and the timer thread can race (the plain store in send_logon
+    // is guarded by a predecessor check — the handshake only ever moves a
+    // pre-logon state forward, and send failures roll it back (F6)).
     bool transition(SessionState expected, SessionState desired);
 
     // -- ResendRequest replay (2.2) -----------------------------------------
@@ -327,7 +373,6 @@ private:
 
     // -- Helpers -------------------------------------------------------------
     bool is_admin_msg(std::string_view msg_type) const noexcept;
-    std::string sending_time_str() const;
     // Current time through the (possibly virtual) clock.
     [[nodiscard]] Millis clock_now() const;
 };

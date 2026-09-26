@@ -519,10 +519,14 @@ TEST(EndToEnd, WrongCompIdRawClientLogoutThenConnectionClosed) {
         raw_read_until(fd, 5000ms, [](const std::string &) { return false; }, &eof);
     ::close(fd);
 
-    EXPECT_TRUE(eof) << "acceptor must close the socket after a CompID violation (F1); got: "
-                     << resp;
+    // F7: the two assertions are deliberately ordered content-first — a hang
+    // where the engine drops the connection WITHOUT saying why must fail on
+    // the missing Logout (the diagnostic), not on the EOF (which such a hang
+    // also produces).
     EXPECT_NE(resp.find("35=5"), std::string::npos)
         << "expected a Logout before the connection closed; got: " << resp;
+    EXPECT_TRUE(eof) << "acceptor must close the socket after a CompID violation (F1); got: "
+                     << resp;
     EXPECT_EQ(acceptor_logons.load(), 0) << "a wrong-CompID Logon must never activate";
 
     // --- Client 2: the acceptor must recover and serve a valid peer -------
@@ -531,12 +535,19 @@ TEST(EndToEnd, WrongCompIdRawClientLogoutThenConnectionClosed) {
     ASSERT_TRUE(raw_send_all(fd2, make_raw_logon("CLIENT", "SERVER", 1)));
     const std::string resp2 = raw_read_until(
         fd2, 5000ms, [](const std::string &s) { return s.find("35=A") != std::string::npos; });
-    ::close(fd2);
-
+    // F7: session state AND the on_logon callback first (both are durable and
+    // poll-able), raw bytes second — a slow read must not be reported as a
+    // broken FSM, and state==Active is published just BEFORE on_logon runs,
+    // so waiting on the counter alone-as-a-follow-up races the callback.
+    ASSERT_TRUE(wait_until(
+        [&] { return acceptor->state() == SessionState::Active && acceptor_logons.load() >= 1; },
+        5000ms))
+        << "acceptor never completed the second handshake (state="
+        << static_cast<int>(acceptor->state()) << " logons=" << acceptor_logons.load() << ")";
+    EXPECT_EQ(acceptor_logons.load(), 1);
     EXPECT_NE(resp2.find("35=A"), std::string::npos)
         << "second raw client must receive a Logon reply; got: " << resp2;
-    ASSERT_TRUE(wait_until([&] { return acceptor->state() == SessionState::Active; }, 5000ms));
-    EXPECT_EQ(acceptor_logons.load(), 1);
+    ::close(fd2);
 
     engine.stop();
 #endif
@@ -676,4 +687,116 @@ TEST(EndToEnd, InitiatorReconnectsAfterAcceptorRestart) {
     EXPECT_EQ(initiator->state(), SessionState::Active);
 
     engine.stop();
+}
+
+// ---------------------------------------------------------------------------
+// F1b. ResetSeqNumFlag on a RE-connect: an initiator whose store has already
+//      carried traffic must renumber its re-Logon from 1 when
+//      reset_on_logon=true. The old code only tagged 141=Y — the advanced
+//      store kept numbering from N+1, so the fresh acceptor (expecting 1)
+//      saw a future MsgSeqNum, answered with a ResendRequest instead of a
+//      Logon, and the handshake never completed. With the store reset the
+//      second handshake converges AND both directions keep flowing.
+// ---------------------------------------------------------------------------
+TEST(EndToEnd, ResetOnLogonRewindsAdvancedStoreOnReconnect) {
+#ifdef _WIN32
+    GTEST_SKIP() << "TCP transport is a documented no-op on Windows";
+#else
+    const std::uint16_t port = find_free_port();
+    ASSERT_NE(port, 0);
+
+    Engine engine(make_engine_config());
+    std::atomic<int> acceptor_logons{0};
+    std::atomic<int> initiator_logons{0};
+    Endpoints ep;
+    std::atomic<bool> initiator_got_reply{false};
+
+    const SessionConfig acc_cfg = make_session_cfg("SERVER", "CLIENT", /*initiator=*/false);
+    const SessionID acceptor_id = acc_cfg.id;
+    SessionCallbacks acceptor_cbs;
+    acceptor_cbs.on_logon = [&](const SessionID &) {
+        ++acceptor_logons;
+    };
+    acceptor_cbs.on_message = [&](const SessionID &, const Message &m) {
+        ep.on_acceptor_message(m);
+    };
+    ASSERT_NE(engine.add_session(acc_cfg, make_tcp_transport(make_transport_cfg(port, false)),
+                                 acceptor_cbs),
+              nullptr);
+
+    SessionConfig init_cfg = make_session_cfg("CLIENT", "SERVER", /*initiator=*/true);
+    init_cfg.reset_on_logon = true;
+    SessionCallbacks initiator_cbs;
+    initiator_cbs.on_logon = [&](const SessionID &) {
+        ++initiator_logons;
+    };
+    initiator_cbs.on_message = [&](const SessionID &, const Message &m) {
+        ep.on_initiator_message(m);
+        if (m.get(tags::ClOrdID).value_or("") == "ORD-RESET-REP")
+            initiator_got_reply.store(true);
+    };
+    Session *initiator = engine.add_session(
+        init_cfg, make_tcp_transport(make_transport_cfg(port, true)), initiator_cbs);
+    ASSERT_NE(initiator, nullptr);
+
+    ASSERT_TRUE(engine.start().has_value());
+    ASSERT_TRUE(wait_until(
+        [&] { return acceptor_logons.load() >= 1 && initiator_logons.load() >= 1; }, 15000ms))
+        << "first handshake failed";
+
+    // --- Carry real traffic so the initiator's store leaves the baseline ----
+    for (int i = 0; i < 3; ++i) {
+        Message order(msg_types::NewOrderSingle);
+        order.set(tags::ClOrdID, "ORD-RESET-" + std::to_string(i));
+        order.set(tags::Symbol, "MSFT");
+        order.set(tags::Side, "1");
+        order.set(tags::OrdType, "2");
+        ASSERT_TRUE(initiator->send(order).has_value());
+    }
+    ASSERT_TRUE(wait_until([&] { return ep.acceptor_got("ORD-RESET-2"); }, 10000ms))
+        << "pre-reconnect traffic never arrived";
+    ASSERT_GE(initiator->store()->next_sender_seq_num(), 5u)
+        << "precondition: the store must be past the baseline";
+
+    // --- Drop the acceptor: FIN at the initiator, which starts reconnecting -
+    ASSERT_TRUE(engine.remove_session(acceptor_id));
+    ASSERT_TRUE(wait_until([&] { return initiator->state() != SessionState::Active; }, 10000ms))
+        << "initiator never observed the acceptor's FIN";
+
+    // --- Re-add the acceptor under the same ID: fresh store, expects seq 1 --
+    Session *acceptor2 = engine.add_session(
+        acc_cfg, make_tcp_transport(make_transport_cfg(port, false)), acceptor_cbs);
+    ASSERT_NE(acceptor2, nullptr);
+
+    ASSERT_TRUE(wait_until(
+        [&] { return acceptor_logons.load() >= 2 && initiator_logons.load() >= 2; }, 20000ms))
+        << "reset re-handshake did not complete (acceptor=" << acceptor_logons.load()
+        << " initiator=" << initiator_logons.load()
+        << ") — the re-Logon must be renumbered from 1 (F1)";
+    EXPECT_EQ(acceptor2->state(), SessionState::Active);
+    EXPECT_EQ(initiator->state(), SessionState::Active);
+    EXPECT_EQ(initiator->store()->next_sender_seq_num(), 2u)
+        << "the re-Logon must restart the numbering at 1 (F1)";
+    EXPECT_EQ(initiator->store()->next_target_seq_num(), 2u)
+        << "the peer's fresh Logon must be accepted at seq 1 (F1)";
+
+    // --- Both directions must still flow after the reset handshake ---------
+    Message again(msg_types::NewOrderSingle);
+    again.set(tags::ClOrdID, "ORD-RESET-AFTER");
+    again.set(tags::Symbol, "MSFT");
+    again.set(tags::Side, "1");
+    again.set(tags::OrdType, "2");
+    ASSERT_TRUE(initiator->send(again).has_value());
+    ASSERT_TRUE(wait_until([&] { return ep.acceptor_got("ORD-RESET-AFTER"); }, 10000ms))
+        << "initiator -> acceptor flow broke after the reset reconnect";
+
+    Message reply(msg_types::ExecutionReport);
+    reply.set(tags::ClOrdID, "ORD-RESET-REP");
+    reply.set(tags::OrderID, "EX-RESET-REP");
+    ASSERT_TRUE(acceptor2->send(reply).has_value());
+    ASSERT_TRUE(wait_until([&] { return initiator_got_reply.load(); }, 10000ms))
+        << "acceptor -> initiator flow broke after the reset reconnect";
+
+    engine.stop();
+#endif
 }
