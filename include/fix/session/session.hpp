@@ -74,6 +74,7 @@ struct SessionCallbacks {
 
     // Transport send callback (engine calls this to write bytes to the wire)
     std::function<void(const std::string &)> do_send;
+    std::function<void()> do_disconnect; // engine → ITransport::disconnect()
 };
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,12 @@ public:
 
     // Called by transport layer when bytes arrive
     void on_data(const char *data, std::size_t len);
+
+    // Called by the engine when the underlying transport connection has been
+    // established (initiator: reset any stale state and send Logon;
+    // acceptor: enter WaitingLogon so an incoming Logon is accepted).
+    // Safe to call on every (re)connect.
+    void on_transport_connected();
 
     // Send an application message (seq assigned automatically)
     Result<void> send(Message msg);
@@ -133,11 +140,39 @@ private:
     std::atomic<std::uint64_t> msgs_received_{0};
 
     mutable std::mutex send_mutex_;
-    TimePoint last_send_time_;
-    TimePoint last_recv_time_;
-    TimePoint logon_sent_time_;
+
+    // -- Shared timing state (F2) -------------------------------------------
+    // Epoch milliseconds, stored atomically: written on IO/user threads
+    // (process_message/send_message/send_logon) and read by the engine's
+    // timer thread (on_timer). Plain TimePoint members raced under TSAN.
+    using Millis = std::chrono::milliseconds::rep;
+    static Millis now_ms() noexcept;
+    std::atomic<Millis> last_send_time_ms_{0};
+    std::atomic<Millis> last_recv_time_ms_{0};
+    std::atomic<Millis> logon_sent_time_ms_{0};
+
+    // -- TestRequest round-trip bookkeeping (F2) ----------------------------
+    // The flag is written by the timer thread (send_test_request) and IO
+    // thread (handle_heartbeat / on_transport_connected / disconnect); the
+    // ID string is guarded by test_req_mtx_ — the mutex is only ever held
+    // for the string itself, never across sends or user callbacks.
+    mutable std::mutex test_req_mtx_;
     std::string pending_test_req_id_;
-    bool test_req_pending_ = false;
+    std::atomic<bool> test_req_pending_{false};
+
+    // -- Heartbeat interval mirror (F2) -------------------------------------
+    // cfg_.heartbeat_interval is written by the IO thread (handle_logon) and
+    // read by the timer thread (on_timer) and by send_logon (any thread).
+    // SessionConfig must stay copyable, so the shared view lives here as an
+    // atomic mirror; construction and handle_logon keep both in sync.
+    std::atomic<int> heartbeat_sec_{30};
+
+    // -- Parser guard (F10/F14) ---------------------------------------------
+    // StreamParser is single-thread-affine (feed/next/reset must not overlap).
+    // on_data holds this only across feed()/next() — never across
+    // process_message() — so disconnect() (which may run on the timer or IO
+    // thread and resets the parser) can never deadlock against it.
+    mutable std::mutex parser_mtx_;
 
     // -- Message dispatch ----------------------------------------------------
     void process_message(const Message &msg);

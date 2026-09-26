@@ -33,6 +33,12 @@ struct EngineConfig {
     bool enable_audit = true;
     int timer_interval_ms = 200; // heartbeat/timer resolution
     std::size_t thread_pool_size = 4;
+
+    // Engine-level transport error sink. Every transport error (bind/connect/
+    // recv/send failures, poll errors) that used to be discarded fires this.
+    // Called on the transport's IO thread (or the caller's, for start-up
+    // errors) – keep it fast and thread-safe.
+    std::function<void(std::error_code)> on_error;
 };
 
 // ---------------------------------------------------------------------------
@@ -45,9 +51,21 @@ public:
 
     // Initialise and start background threads
     Result<void> start();
+
+    // Stop everything: logout all sessions, join the timer thread and every
+    // transport IO thread, then release all sessions.
+    //
+    // Calling contract: stop() must NOT be called from a session callback
+    // (i.e. from a transport IO thread or the timer thread) on the normal
+    // path – it joins those threads. As a backstop against hard termination
+    // (~thread aborts) a transport owned by the calling thread itself is
+    // parked in a never-destroyed quarantine instead of being joined here;
+    // everything else is still stopped and joined synchronously.
     void stop();
 
-    // Create a new session with a given transport
+    // Create a new session with a given transport. The transport is started
+    // immediately if the engine is already running. Returns nullptr when
+    // `transport` is null or a session with the same SessionID exists.
     Session *add_session(SessionConfig cfg, std::unique_ptr<ITransport> transport,
                          SessionCallbacks cbs = {}, const DataDictionary *dict = nullptr);
 
@@ -79,15 +97,23 @@ private:
     std::atomic<bool> running_{false};
     std::thread timer_thread_;
 
-    // Transport → Session wiring per connection
+    // Transport → Session wiring per connection. Both are shared: the session
+    // outlives its raw handle while callbacks run, and the transport must stay
+    // alive until stop() has joined its IO thread.
     struct Connection {
-        std::unique_ptr<ITransport> transport;
-        Session *session = nullptr;
+        std::shared_ptr<ITransport> transport;
+        std::shared_ptr<Session> session;
     };
     std::vector<Connection> connections_;
     mutable std::mutex conn_mutex_;
 
-    void timer_loop();
+    // Sessions whose transport IO thread is the thread that removed them: the
+    // IO thread cannot join itself, so remove_session() parks them here and
+    // the timer thread reaps them (stop → join → destroy, off the IO thread).
+    // Guarded by conn_mutex_; swapped out wholesale by drain_reap_list().
+    std::vector<Connection> reap_list_;
+
+    void drain_reap_list();
 };
 
 } // namespace fix

@@ -8,6 +8,22 @@
 
 namespace fix {
 
+namespace {
+
+// Intentional leak, see Engine::stop(): a transport whose IO thread is the
+// current thread can never be joined or destroyed on this thread (~thread on
+// a joinable std::thread aborts the process). Parking the entry in a heap
+// allocation that is deliberately never freed keeps the joinable thread object
+// alive for the rest of the process' life; stop() has already requested
+// shutdown, so the IO thread exits on its own.
+template <typename T>
+void quarantine(T entry) {
+    static auto *sink = new std::vector<T>; // never deleted – on purpose
+    sink->push_back(std::move(entry));
+}
+
+} // namespace
+
 Engine::Engine(EngineConfig cfg)
     : cfg_(std::move(cfg)) {
     if (cfg_.enable_audit) {
@@ -33,16 +49,26 @@ Result<void> Engine::start() {
         while (running_.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(cfg_.timer_interval_ms));
             sessions_.tick_all();
+            // Sessions removed from a session callback (their own IO thread)
+            // are reaped here: join the IO thread, then destroy – never on
+            // the IO thread itself (that would ~thread-abort).
+            drain_reap_list();
         }
     });
 
-    // Start all registered transports
+    // Snapshot under the lock, start outside it: start() may join a stale
+    // thread left by an earlier stop()-from-callback, and that thread could be
+    // inside a session callback calling Engine::remove_session() (which takes
+    // conn_mutex_) – holding the lock across start() deadlocks.
+    std::vector<std::shared_ptr<ITransport>> transports;
     {
         std::lock_guard lock(conn_mutex_);
-        for (auto &conn : connections_) {
-            conn.transport->start();
-        }
+        transports.reserve(connections_.size());
+        for (const auto &conn : connections_)
+            transports.push_back(conn.transport);
     }
+    for (const auto &transport : transports)
+        (void)transport->start();
 
     return {};
 }
@@ -50,8 +76,19 @@ Result<void> Engine::start() {
 void Engine::stop() {
     if (!running_.exchange(false))
         return;
-    if (timer_thread_.joinable())
-        timer_thread_.join();
+    if (timer_thread_.joinable()) {
+        if (timer_thread_.get_id() == std::this_thread::get_id() || on_transport_io_thread())
+            // Called from the timer callback itself (joining self aborts) or
+            // from a transport IO thread (the timer may currently be joining
+            // *this* thread in drain_reap_list() – joining it back would
+            // deadlock). Detach instead: the loop exits on its next iteration
+            // because running_ is already false. stop()-from-a-callback is a
+            // documented contract violation anyway; the quarantine below is
+            // the backstop, not a supported path.
+            timer_thread_.detach();
+        else
+            timer_thread_.join();
+    }
 
     // Logout all sessions
     sessions_.for_each([](Session &s) {
@@ -60,18 +97,79 @@ void Engine::stop() {
         }
     });
 
-    // Stop all transports
-    std::lock_guard lock(conn_mutex_);
-    for (auto &conn : connections_) {
-        conn.transport->stop();
+    // Snapshot under the lock, stop outside it: stop() joins the transport IO
+    // threads, and a callback running on one of them may re-enter the Engine
+    // (remove_session/stop) which takes conn_mutex_ – holding it across the
+    // join deadlocks (reproduced).
+    std::vector<Connection> conns;
+    {
+        std::lock_guard lock(conn_mutex_);
+        conns = std::move(connections_);
+        connections_.clear(); // moved-from state must not be relied upon
     }
-    connections_.clear();
+    for (auto &conn : conns) {
+        const bool self = conn.transport->on_io_thread();
+        conn.transport->stop(); // self: requests shutdown but cannot join
+        if (self) {
+            // This IO thread *is* us: park the entry for the reap pass below,
+            // which quarantines anything still owned by this thread.
+            std::lock_guard lock(conn_mutex_);
+            reap_list_.push_back(std::move(conn));
+        }
+        // else: joined here; conn is released at the end of the iteration,
+        // i.e. the session is destroyed only after its IO thread is gone.
+    }
+
+    // The timer thread is gone, so nothing else drains the reap list: do a
+    // synchronous pass now (joins everything not owned by this thread), then
+    // quarantine what remains.
+    drain_reap_list();
+}
+
+void Engine::drain_reap_list() {
+    std::vector<Connection> reap;
+    {
+        std::lock_guard lock(conn_mutex_);
+        reap.swap(reap_list_);
+    }
+    // Join outside the lock: the IO thread being joined may itself call
+    // remove_session()/stop(), both of which take conn_mutex_.
+    for (auto &conn : reap) {
+        if (conn.transport->on_io_thread()) {
+            // Owned by this thread – stop() only requests shutdown here;
+            // destroying the joinable thread object on its own thread would
+            // abort, so park it in the quarantine instead.
+            conn.transport->stop();
+            quarantine(std::move(conn));
+        } else {
+            conn.transport->stop(); // joins; conn released after the join
+        }
+    }
 }
 
 Session *Engine::add_session(SessionConfig cfg, std::unique_ptr<ITransport> transport,
                              SessionCallbacks user_cbs, const DataDictionary *dict) {
-    // Wire up transport → session
-    SessionCallbacks internal_cbs = user_cbs;
+    if (!transport)
+        return nullptr;
+
+    // The transport is shared: the session's do_send/do_disconnect closures,
+    // the Connection and the (weak) transport callbacks all need to keep it
+    // alive, and stop() must be able to join its IO thread before anything is
+    // destroyed.
+    auto shared_transport = std::shared_ptr<ITransport>(std::move(transport));
+
+    // Wire session → transport *before* the session is created: the closures
+    // only capture the transport, which already exists at this point.
+    SessionCallbacks internal_cbs = std::move(user_cbs);
+    internal_cbs.do_send = [t = shared_transport](const std::string &bytes) {
+        (void)t->send(bytes);
+    };
+    // Session::disconnect() (CompID mismatch, heartbeat timeout, …) must
+    // actually close the socket, otherwise a hostile peer pins the acceptor's
+    // event loop forever and initiators never reconnect (F1).
+    internal_cbs.do_disconnect = [t = shared_transport] {
+        t->disconnect();
+    };
 
     // Create store
     std::unique_ptr<IMessageStore> store;
@@ -81,36 +179,111 @@ Session *Engine::add_session(SessionConfig cfg, std::unique_ptr<ITransport> tran
         store = std::make_unique<MemoryStore>();
     }
 
-    Session *sess = sessions_.create_session(std::move(cfg), std::move(store), dict, internal_cbs);
+    auto session =
+        sessions_.create_session(std::move(cfg), std::move(store), dict, std::move(internal_cbs));
+    if (!session)
+        return nullptr; // duplicate SessionID – never silently replace
 
-    if (transport) {
-        transport->set_on_connected([sess] {
-            if (sess->id().version >= FixVersion::FIX_4_2) {
-                // Initiator automatically sends Logon on connect
-                // (acceptors wait)
-                // The SessionConfig.initiator flag controls this
-            }
-        });
-        transport->set_on_data(
-            [sess](const char *data, std::size_t len) { sess->on_data(data, len); });
-        transport->set_on_disconnected([sess](std::string_view reason) { sess->disconnect(); });
+    // Wire transport → session. Callbacks capture a weak_ptr: a session that is
+    // removed while the transport IO thread is still draining cannot be
+    // touched after destruction.
+    std::weak_ptr<Session> weak = session;
+    shared_transport->set_on_connected([weak] {
+        if (auto s = weak.lock())
+            s->on_transport_connected();
+    });
+    shared_transport->set_on_data([weak](const char *data, std::size_t len) {
+        if (auto s = weak.lock())
+            s->on_data(data, len);
+    });
+    shared_transport->set_on_disconnected([weak](std::string_view /*reason*/) {
+        if (auto s = weak.lock())
+            s->disconnect();
+    });
+    // Transport errors used to be fired into the void (set_on_error was never
+    // called): surface them on the engine-level sink instead (F6).
+    shared_transport->set_on_error([cb = cfg_.on_error](std::error_code ec) {
+        if (cb)
+            cb(ec);
+    });
 
-        // Wire session send → transport
-        // We need to update the session's do_send callback
-        // Since Session callbacks are set at construction, we do it via a shared
-        // transport pointer approach. This is a design limitation we handle by
-        // setting the do_send on the session after creation.
-        // For now, we store the connection and let the session use it directly.
-
+    bool should_start = false;
+    {
         std::lock_guard lock(conn_mutex_);
-        connections_.push_back({std::move(transport), sess});
+        connections_.push_back({shared_transport, session});
+        // add_session() after start(): start the transport below – Engine::
+        // start() only sweeps the connections that existed when it ran.
+        should_start = running_.load(std::memory_order_acquire);
+    }
+    if (should_start) {
+        // Start *outside* conn_mutex_: start() may join a stale thread left
+        // by an earlier stop()-from-callback, and that thread could be inside
+        // a session callback that calls Engine::remove_session() (which takes
+        // conn_mutex_) – holding the lock across start() deadlocks (F4).
+        if (!shared_transport->start().has_value()) {
+            // Roll back under a brief lock re-acquire, then stop outside it.
+            bool owned = false;
+            {
+                std::lock_guard lock(conn_mutex_);
+                auto it = std::find_if(connections_.begin(), connections_.end(),
+                                       [&shared_transport](const Connection &c) {
+                                           return c.transport == shared_transport;
+                                       });
+                if (it != connections_.end()) {
+                    connections_.erase(it);
+                    owned = true;
+                }
+            }
+            if (owned)
+                shared_transport->stop();
+            (void)sessions_.remove(session->id());
+            return nullptr;
+        }
     }
 
-    return sess;
+    return session.get();
 }
 
 bool Engine::remove_session(const SessionID &sid) {
-    return sessions_.remove(sid);
+    Connection conn;
+    bool found = false;
+    {
+        std::lock_guard lock(conn_mutex_);
+        auto it =
+            std::find_if(connections_.begin(), connections_.end(), [&sid](const Connection &c) {
+                return c.session && c.session->id() == sid;
+            });
+        if (it != connections_.end()) {
+            // Drop the connection first so a concurrent Engine::start()/stop()
+            // cannot resurrect it; the local Connection keeps both alive.
+            conn = std::move(*it);
+            connections_.erase(it);
+            found = true;
+        }
+    }
+    // Remove from the manager immediately so lookups fail from here on. The
+    // local Connection (or the reap entry below) keeps the session alive until
+    // its transport IO thread has been joined.
+    const bool removed = sessions_.remove(sid);
+
+    if (found) {
+        if (conn.transport->on_io_thread()) {
+            // Called from this transport's own IO thread (a session callback):
+            // stop() cannot join itself, and destroying the joinable thread
+            // here would abort (~thread). Park the entry for the timer thread,
+            // which reaps it off this thread (F3). sessions_.remove above
+            // already ran, so lookups fail while the reap entry holds the last
+            // strong reference.
+            std::lock_guard lock(conn_mutex_);
+            reap_list_.push_back(std::move(conn));
+        } else {
+            // Stop + join the IO thread *outside* conn_mutex_ (never hold it
+            // across a join – F4); the session is destroyed after the join
+            // when `conn` goes out of scope.
+            conn.transport->stop();
+        }
+    }
+    return removed;
 }
 
 Session *Engine::get_session(const SessionID &sid) noexcept {

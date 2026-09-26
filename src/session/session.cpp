@@ -39,24 +39,85 @@ Session::Session(SessionConfig cfg, std::unique_ptr<IMessageStore> store,
       store_(std::move(store)),
       dict_(dict),
       cbs_(std::move(cbs)) {
-    last_send_time_ = now();
-    last_recv_time_ = now();
+    heartbeat_sec_.store(cfg_.heartbeat_interval, std::memory_order_relaxed);
+    last_send_time_ms_.store(now_ms(), std::memory_order_relaxed);
+    last_recv_time_ms_.store(now_ms(), std::memory_order_relaxed);
+    logon_sent_time_ms_.store(now_ms(), std::memory_order_relaxed);
 }
 
 Session::~Session() = default;
+
+Session::Millis Session::now_ms() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
+        .count();
+}
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 void Session::on_data(const char *data, std::size_t len) {
-    parser_.feed(data, len);
+    bool healthy = false;
     Message msg;
-    while (parser_.next(msg)) {
+    {
+        std::lock_guard lock(parser_mtx_);
+        parser_.feed(data, len);
+        healthy = parser_.healthy();
+    }
+    if (!healthy) {
+        // F10: the parser latched a fatal condition (an un-reclaimable
+        // backlog). Surface it by dropping the connection — disconnect()
+        // closes the transport AND resets the parser, so a reconnect starts
+        // from a clean slate instead of a wedged, dropping parser.
+        disconnect();
+        return;
+    }
+    while (true) {
+        {
+            std::lock_guard lock(parser_mtx_);
+            if (!parser_.next(msg))
+                break;
+        }
+        // F14: stop dispatching once the session is torn down — e.g. an
+        // identity mismatch on message 1 must not process message 2 from the
+        // same batch.
+        if (state_.load() == SessionState::Disconnected)
+            break;
         try {
             process_message(msg);
         } catch (const std::exception &e) {
             // Log and continue – don't let a single bad message kill the session
         }
+    }
+}
+
+void Session::on_transport_connected() {
+    // Fresh byte stream: any partial parser state or stale timer flags left
+    // over from the previous connection are meaningless.
+    {
+        std::lock_guard lock(parser_mtx_);
+        parser_.reset();
+    }
+    test_req_pending_.store(false, std::memory_order_release);
+    {
+        std::lock_guard lock(test_req_mtx_);
+        pending_test_req_id_.clear();
+    }
+    last_send_time_ms_.store(now_ms(), std::memory_order_relaxed);
+    last_recv_time_ms_.store(now_ms(), std::memory_order_relaxed);
+
+    if (cfg_.initiator) {
+        // A dropped connection can leave the FSM in LogonSent/Active/LogoutSent
+        // while logon() only accepts NotConnected/Reconnecting/Disconnected –
+        // normalise first so the initiator always re-logons on reconnect.
+        auto st = state_.load();
+        if (st != SessionState::NotConnected && st != SessionState::Reconnecting &&
+            st != SessionState::Disconnected) {
+            state_.store(SessionState::Disconnected);
+        }
+        (void)logon();
+    } else {
+        // Acceptor: only WaitingLogon accepts an inbound Logon.
+        state_.store(SessionState::WaitingLogon);
     }
 }
 
@@ -68,7 +129,7 @@ Result<void> Session::send_raw(const std::string &raw) {
     std::lock_guard lock(send_mutex_);
     if (cbs_.do_send)
         cbs_.do_send(raw);
-    last_send_time_ = now();
+    last_send_time_ms_.store(now_ms(), std::memory_order_relaxed);
     ++msgs_sent_;
     return {};
 }
@@ -94,19 +155,22 @@ void Session::on_timer() {
         st != SessionState::WaitingLogon)
         return;
 
-    auto n = now();
-    using namespace std::chrono_literals;
+    const auto n = now_ms();
+    // Timer-side reads go through the atomic mirror — cfg_.heartbeat_interval
+    // is written by the IO thread in handle_logon (F2).
+    const auto hb_ms = static_cast<Millis>(heartbeat_sec_.load(std::memory_order_relaxed)) * 1000;
 
     // Heartbeat check: if we haven't sent anything in heartbeat_interval, send HB
-    auto hb = std::chrono::seconds(cfg_.heartbeat_interval);
-    if ((n - last_send_time_) >= hb && st == SessionState::Active) {
+    if ((n - last_send_time_ms_.load(std::memory_order_relaxed)) >= hb_ms &&
+        st == SessionState::Active) {
         send_heartbeat();
     }
 
     // TestRequest: if we haven't received anything in heartbeat_interval + tolerance
-    auto tolerance = std::chrono::seconds(cfg_.heartbeat_interval + 2);
-    if ((n - last_recv_time_) >= tolerance && st == SessionState::Active) {
-        if (!test_req_pending_) {
+    const auto tolerance_ms = hb_ms + 2000;
+    if ((n - last_recv_time_ms_.load(std::memory_order_relaxed)) >= tolerance_ms &&
+        st == SessionState::Active) {
+        if (!test_req_pending_.load(std::memory_order_acquire)) {
             send_test_request();
         } else {
             // No response to TestRequest – timeout
@@ -118,8 +182,8 @@ void Session::on_timer() {
 
     // Logon timeout
     if (st == SessionState::LogonSent) {
-        auto timeout = std::chrono::seconds(cfg_.logon_timeout);
-        if ((n - logon_sent_time_) >= timeout) {
+        auto timeout_ms = static_cast<Millis>(cfg_.logon_timeout) * 1000;
+        if ((n - logon_sent_time_ms_.load(std::memory_order_relaxed)) >= timeout_ms) {
             disconnect();
         }
     }
@@ -127,13 +191,41 @@ void Session::on_timer() {
 
 void Session::disconnect() {
     state_.store(SessionState::Disconnected);
+
+    // The TestRequest round trip can never complete on a dead connection.
+    test_req_pending_.store(false, std::memory_order_release);
+    {
+        std::lock_guard lock(test_req_mtx_);
+        pending_test_req_id_.clear();
+    }
+    // Drop partial frames / re-arm a parser that latched unhealthy so a
+    // reconnect starts clean (also required by F10).
+    {
+        std::lock_guard lock(parser_mtx_);
+        parser_.reset();
+    }
+    // Close the byte stream (F1). This half was missing: the engine wires
+    // do_disconnect to ITransport::disconnect(), so without this call a
+    // CompID-mismatched peer kept the socket open forever. Safe to invoke
+    // from the transport's on_disconnected callback: by then
+    // TcpTransport::close_connection() has already run, so disconnect()
+    // sees conn_fd_ < 0 and no-ops — the callback chain terminates after one
+    // hop instead of looping.
+    if (cbs_.do_disconnect)
+        cbs_.do_disconnect();
 }
 
 Result<void> Session::reset() {
     state_.store(SessionState::NotConnected);
-    parser_.reset();
-    test_req_pending_ = false;
-    pending_test_req_id_.clear();
+    {
+        std::lock_guard lock(parser_mtx_);
+        parser_.reset();
+    }
+    test_req_pending_.store(false, std::memory_order_release);
+    {
+        std::lock_guard lock(test_req_mtx_);
+        pending_test_req_id_.clear();
+    }
     if (store_)
         return store_->reset();
     return {};
@@ -143,9 +235,25 @@ Result<void> Session::reset() {
 // Message processing
 // ---------------------------------------------------------------------------
 void Session::process_message(const Message &msg) {
-    last_recv_time_ = now();
+    last_recv_time_ms_.store(now_ms(), std::memory_order_relaxed);
 
-    // Validate BeginString matches our session (could add version check here)
+    // --- Session identity validation (security) -----------------------------
+    // BeginString must be present, parseable, and match this session's version.
+    if (msg.begin_string_version() != cfg_.id.version) {
+        send_logout("BeginString does not match session");
+        disconnect();
+        return;
+    }
+    // The counterparty must identify itself with our target CompID and address
+    // us with our sender CompID. Anything else is a protocol violation and a
+    // potential session-hijack attempt: terminate without processing the body.
+    auto sender = msg.get(tags::SenderCompID);
+    auto target = msg.get(tags::TargetCompID);
+    if (!sender || !target || *sender != cfg_.id.targetCompID || *target != cfg_.id.senderCompID) {
+        send_logout("CompID mismatch");
+        disconnect();
+        return;
+    }
 
     // Basic validation
     if (!msg.has(tags::MsgType)) {
@@ -156,10 +264,29 @@ void Session::process_message(const Message &msg) {
 
     // Sequence number validation (unless we're in logon state)
     auto st = state_.load();
-    if (st != SessionState::WaitingLogon && st != SessionState::LogonSent &&
-        st != SessionState::NotConnected) {
+    const bool seq_validated = st != SessionState::WaitingLogon && st != SessionState::LogonSent &&
+                               st != SessionState::NotConnected;
+    if (seq_validated) {
         if (!validate_seq_num(msg))
             return;
+    }
+
+    // Duplicate standard-header tags: Reject (reason 13) for ANY parsed
+    // message, including one received in a logon state (F7) — a duplicate-
+    // header Logon must be rejected too, not silently accepted. RefSeqNum is
+    // msg.seq_num(), which the parser keeps as the first (valid) occurrence.
+    if (msg.has_duplicate_header()) {
+        send_reject(msg.seq_num(), SessionRejectReason::TagAppearsMoreThanOnce,
+                    std::string(msg.msg_type()), 0, "Tag appears more than once");
+        // Consume the sequence number only when sequence validation actually
+        // ran (the state-gated path above) and the message is not a re-send;
+        // in logon states we just Reject and return without consuming.
+        if (seq_validated && !msg.poss_dup()) {
+            store_->incr_target_seq_num();
+            store_->store_inbound(msg.seq_num(), msg.raw());
+        }
+        ++msgs_received_;
+        return;
     }
 
     auto mt = msg.msg_type();
@@ -214,8 +341,12 @@ void Session::handle_logon(const Message &msg) {
 
     // Extract fields
     auto hb_opt = msg.get_int(tags::HeartBtInt);
-    if (hb_opt)
+    if (hb_opt) {
+        // SessionConfig stays copyable (no atomics), so the timer-visible
+        // value is mirrored into heartbeat_sec_ (F2).
         cfg_.heartbeat_interval = static_cast<int>(*hb_opt);
+        heartbeat_sec_.store(static_cast<int>(*hb_opt), std::memory_order_release);
+    }
 
     bool reset_flag = msg.get(tags::ResetSeqNumFlag).value_or("N") == "Y";
     if (reset_flag || cfg_.reset_on_logon) {
@@ -261,9 +392,13 @@ void Session::handle_logout(const Message &msg) {
 
 void Session::handle_heartbeat(const Message &msg) {
     auto test_id = msg.get(tags::TestReqID).value_or("");
-    if (test_req_pending_ && test_id == pending_test_req_id_) {
-        test_req_pending_ = false;
-        pending_test_req_id_ = "";
+    if (!test_req_pending_.load(std::memory_order_acquire))
+        return;
+    // test_req_mtx_ only ever covers the ID string — never a send or callback.
+    std::lock_guard lock(test_req_mtx_);
+    if (test_id == pending_test_req_id_) {
+        pending_test_req_id_.clear();
+        test_req_pending_.store(false, std::memory_order_release);
     }
 }
 
@@ -353,7 +488,9 @@ bool Session::validate_seq_num(const Message &msg) {
 void Session::send_logon() {
     Message m(msg_types::Logon);
     m.set(tags::EncryptMethod, std::int64_t(0));
-    m.set(tags::HeartBtInt, std::int64_t(cfg_.heartbeat_interval));
+    // send_logon can run on user/timer threads while handle_logon (IO thread)
+    // adopts the peer's HeartBtInt — read the atomic mirror, not cfg_ (F2).
+    m.set(tags::HeartBtInt, std::int64_t(heartbeat_sec_.load(std::memory_order_acquire)));
     if (cfg_.reset_on_logon)
         m.set(tags::ResetSeqNumFlag, "Y");
     if (!cfg_.username.empty())
@@ -363,7 +500,7 @@ void Session::send_logon() {
     if (!cfg_.default_appl_ver_id.empty())
         m.set(tags::DefaultApplVerID, cfg_.default_appl_ver_id);
     send_message(m);
-    logon_sent_time_ = now();
+    logon_sent_time_ms_.store(now_ms(), std::memory_order_relaxed);
     if (cfg_.initiator)
         state_.store(SessionState::LogonSent);
     else
@@ -387,11 +524,17 @@ void Session::send_heartbeat(std::string_view test_req_id) {
 
 void Session::send_test_request() {
     static std::atomic<std::uint64_t> counter{0};
-    pending_test_req_id_ = "TEST-" + std::to_string(++counter);
-    test_req_pending_ = true;
+    const std::string req_id = "TEST-" + std::to_string(++counter);
+    {
+        // Publish the ID before the flag and before the send, and never hold
+        // the mutex across send_message() (F2).
+        std::lock_guard lock(test_req_mtx_);
+        pending_test_req_id_ = req_id;
+    }
+    test_req_pending_.store(true, std::memory_order_release);
 
     Message m(msg_types::TestRequest);
-    m.set(tags::TestReqID, pending_test_req_id_);
+    m.set(tags::TestReqID, req_id);
     send_message(m);
 }
 
@@ -432,15 +575,23 @@ Result<void> Session::send_message(Message &msg) {
     auto bs = fix::to_string(cfg_.id.version);
     auto ts = MessageBuilder::format_timestamp_now();
 
-    std::string wire =
-        builder_.serialize(msg, bs, seq, cfg_.id.senderCompID, cfg_.id.targetCompID, ts);
-    store_->store_outbound(seq, wire);
+    // Strict serialization (F5): try_serialize() surfaces the first rejected
+    // field (e.g. an SOH smuggled in through Message::fields()) instead of
+    // returning "". The error must be returned BEFORE the sequence number is
+    // stored/incremented — the old code stored an empty wire frame, bumped
+    // the sender seq and sent nothing, leaving a permanent gap.
+    auto wire =
+        builder_.try_serialize(msg, bs, seq, cfg_.id.senderCompID, cfg_.id.targetCompID, ts);
+    if (!wire)
+        return std::unexpected(wire.error());
+
+    store_->store_outbound(seq, *wire);
     store_->incr_sender_seq_num();
 
     if (cbs_.do_send)
-        cbs_.do_send(wire);
+        cbs_.do_send(*wire);
 
-    last_send_time_ = now();
+    last_send_time_ms_.store(now_ms(), std::memory_order_relaxed);
     ++msgs_sent_;
     return {};
 }

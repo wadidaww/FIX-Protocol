@@ -56,15 +56,26 @@ std::string MessageBuilder::build(std::string_view begin_string, std::string_vie
     return result;
 }
 
-std::string MessageBuilder::serialize(const Message &msg, std::string_view begin_string,
-                                      SeqNum seq_num, std::string_view sender,
-                                      std::string_view target, std::string_view sending_time) {
-    begin(begin_string, msg.msg_type());
+// Strict serializer: same output as serialize(), but surfaces the first
+// rejected field value instead of collapsing to "". Header emission order
+// (8, 9, 35, 49, 56, 34, 52) and checksum/body-length math in build() are
+// unchanged — this only adds per-field validation on top.
+Result<std::string> MessageBuilder::try_serialize(const Message &msg, std::string_view begin_string,
+                                                  SeqNum seq_num, std::string_view sender,
+                                                  std::string_view target,
+                                                  std::string_view sending_time) {
+    if (auto r = begin(begin_string, msg.msg_type()); !r)
+        return std::unexpected(r.error());
+
     // Standard header fields (after 8, 9, 35)
-    add(tags::SenderCompID, sender);
-    add(tags::TargetCompID, target);
-    add(tags::MsgSeqNum, static_cast<std::int64_t>(seq_num));
-    add(tags::SendingTime, sending_time);
+    if (auto r = add(tags::SenderCompID, sender); !r)
+        return std::unexpected(r.error());
+    if (auto r = add(tags::TargetCompID, target); !r)
+        return std::unexpected(r.error());
+    if (auto r = add(tags::MsgSeqNum, static_cast<std::int64_t>(seq_num)); !r)
+        return std::unexpected(r.error());
+    if (auto r = add(tags::SendingTime, sending_time); !r)
+        return std::unexpected(r.error());
 
     // Body fields (skip header/trailer tags we already handle)
     for (const auto &f : msg.fields()) {
@@ -73,9 +84,12 @@ std::string MessageBuilder::serialize(const Message &msg, std::string_view begin
             f.tag == tags::MsgSeqNum || f.tag == tags::SendingTime || f.tag == tags::CheckSum) {
             continue;
         }
-        add(f.tag, f.value);
+        if (auto r = add(f.tag, f.value); !r)
+            return std::unexpected(r.error());
     }
-    return finish();
+    if (last_error_)
+        return std::unexpected(last_error_);
+    return build(begin_string_, body_);
 }
 
 std::string MessageBuilder::format_timestamp(TimePoint tp) {

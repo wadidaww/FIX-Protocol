@@ -6,21 +6,32 @@
 namespace fix {
 
 std::string SessionManager::make_key(const SessionID &sid) {
+    // qualifier participates: sessions that differ only by qualifier must not
+    // collide (they are distinct FIX sessions).
     return sid.senderCompID + ":" + sid.targetCompID + ":" +
-           std::string(fix::to_string(sid.version));
+           std::string(fix::to_string(sid.version)) + ":" + sid.qualifier;
 }
 
-Session *SessionManager::create_session(SessionConfig cfg, std::unique_ptr<IMessageStore> store,
-                                        const DataDictionary *dict, SessionCallbacks cbs) {
+std::shared_ptr<Session> SessionManager::create_session(SessionConfig cfg,
+                                                        std::unique_ptr<IMessageStore> store,
+                                                        const DataDictionary *dict,
+                                                        SessionCallbacks cbs) {
     if (!store)
         store = std::make_unique<MemoryStore>();
 
     auto key = make_key(cfg.id);
-    auto sess = std::make_unique<Session>(std::move(cfg), std::move(store), dict, std::move(cbs));
+    auto sess = std::make_shared<Session>(std::move(cfg), std::move(store), dict, std::move(cbs));
     std::unique_lock lock(mutex_);
-    auto *ptr = sess.get();
-    sessions_[key] = std::move(sess);
-    return ptr;
+    auto [it, inserted] = sessions_.try_emplace(key, sess);
+    if (!inserted)
+        return {}; // duplicate SessionID – never replace a live session
+    return sess;
+}
+
+std::shared_ptr<Session> SessionManager::find_shared(const SessionID &sid) {
+    std::shared_lock lock(mutex_);
+    auto it = sessions_.find(make_key(sid));
+    return it != sessions_.end() ? it->second : nullptr;
 }
 
 Session *SessionManager::find(const SessionID &sid) noexcept {

@@ -174,6 +174,7 @@ if(FIX_BUILD_TESTS)
         tests/test_session.cpp
         tests/test_dictionary.cpp
         tests/test_store.cpp
+        tests/test_e2e.cpp
     )
 
     target_link_libraries(fix_tests
