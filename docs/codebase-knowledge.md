@@ -69,7 +69,7 @@ ITransport (TcpTransport)  ← 1 thread per transport, epoll ET (Linux) / busy-p
 
 ### Transmit path
 1. `Session::send()` → `send_message()` — `session.cpp:428-446`: under `send_mutex_`: assign seq → `builder_.serialize(msg,…)` → `store_outbound` (**Result discarded**) → `cbs_.do_send(wire)`.
-2. `MessageBuilder` — `serializer.cpp:21-79`: `begin()` emits `35=` first, forced header `49,56,34,[43],[122],52` (43 `PossDupFlag` / 122 `OrigSendingTime` in header position when present — F5), appends other fields in stored order minus skip-list, `finish()` computes BodyLength (`= body.size()`) + CheckSum (mod-256 over `8=…9=N\x01body`).
+2. `try_serialize` — `serializer.cpp:83-96`: emits the fixed header `8,9,35,49,56,34,[43],[122],52` (43 `PossDupFlag` / 122 `OrigSendingTime` in header position when present — F5; `123`/`36` deliberately stay body fields), then all remaining fields in stored order minus the header skip-list; `build()` computes BodyLength + CheckSum (mod-256).
 3. `TcpTransport::send()` — direct `::send()` if connected, else queue under `send_mutex_`.
 
 ### Threads
@@ -200,7 +200,7 @@ A single `Session` is touched by ≥3 threads. Only outbound path has `send_mute
 ### Engine lifecycle
 - `add_session` **after `start()`**: transport never started (sweep only in `start()`) → silent no-op.
 - `Engine::stop()`: no wait for Logout response, transports stopped before queued bytes flush; `start/stop` cycles broken (`stop()` clears `connections_`).
-- `Engine::timer_loop()` declared never defined; dead `Engine::dicts_` member.
+- Dead `Engine::dicts_` member (the `Engine::timer_loop()` claim removed — the timer is a lambda in `start()`, `engine.cpp`.)
 - Transport callbacks capture raw `Session*`; `SessionCallbacks` copied 3× per `add_session` (missing `std::move`).
 
 ### Error handling

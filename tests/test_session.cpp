@@ -984,12 +984,18 @@ TEST(SessionTest, TestRequestDeadlineIsOnePointTwoHeartbeats) {
 TEST(SessionTest, LogoutTimeoutDisconnectsAndKeepsHeartbeats) {
     std::vector<std::string> sent;
     bool disconnect_called = false;
+    int logout_calls = 0;
+    std::string logout_reason;
     SessionCallbacks cbs;
     cbs.do_send = [&](const std::string &s) {
         sent.push_back(s);
     };
     cbs.do_disconnect = [&]() {
         disconnect_called = true;
+    };
+    cbs.on_logout = [&](const SessionID &, std::string_view r) {
+        ++logout_calls;
+        logout_reason = r;
     };
 
     SessionConfig cfg = make_cfg(false);
@@ -1019,6 +1025,13 @@ TEST(SessionTest, LogoutTimeoutDisconnectsAndKeepsHeartbeats) {
     sess.on_timer();
     EXPECT_EQ(sess.state(), SessionState::Disconnected);
     EXPECT_TRUE(disconnect_called);
+    // #8: the app must learn the session ended at the timeout (it used to
+    // only see on_logout for a COMPLETED logout and hung releasing resources).
+    EXPECT_EQ(logout_calls, 1) << "logout timeout notifies exactly once";
+    EXPECT_EQ(logout_reason, std::string("logout timeout"));
+    // A late peer Logout after the timeout must not double-notify.
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::Logout, 2, "CLIENT", "SERVER"));
+    EXPECT_EQ(logout_calls, 1) << "notify_logout gate suppresses the late duplicate";
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,4 +1977,162 @@ TEST(SessionTest, PeerInitiatedLogoutClosesConnection) {
     EXPECT_EQ(count_msg_type(sent, msg_types::Logout), 1u) << "the echo still goes out (F2)";
     EXPECT_EQ(logout_calls, 1) << "exactly one on_logout, not one per branch (F2)";
     EXPECT_EQ(logout_reason, std::string("Goodbye"));
+}
+
+// ===========================================================================
+// Follow-up round: Phase 2 re-verification blockers.
+// ===========================================================================
+
+// Blocker 2: F3's regression must pin the REPORTED scenario — an IN-SEQUENCE
+// *PossDup* with a duplicated header in Active. The pre-fix gate
+// (seq_validated && !poss_dup) rejected-but-never-consumed exactly this
+// message; the earlier non-PossDup test passed even with the fix reverted.
+TEST(SessionTest, ActivePossDupDuplicateHeaderRejectConsumesSequence) {
+    std::vector<std::string> sent;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs);
+    handshake_acceptor(sess);
+    ASSERT_EQ(sess.state(), SessionState::Active);
+    ASSERT_EQ(sess.store()->next_target_seq_num(), 2u);
+
+    MessageBuilder b;
+    b.begin("FIX.4.2", msg_types::Heartbeat);
+    b.add(tags::PossDupFlag, "Y"); // the case the old gate let through
+    b.add(tags::SenderCompID, "CLIENT");
+    b.add(tags::SenderCompID, "CLIENT"); // duplicate standard-header tag
+    b.add(tags::TargetCompID, "SERVER");
+    b.add(tags::MsgSeqNum, std::int64_t(2));
+    b.add(tags::SendingTime, "20240101-12:00:00.000");
+    const std::string wire = b.finish();
+    ASSERT_FALSE(wire.empty());
+    feed_wire(sess, wire);
+
+    EXPECT_EQ(count_msg_type(sent, msg_types::Reject), 1u);
+    EXPECT_EQ(sess.store()->next_target_seq_num(), 3u)
+        << "in-sequence PossDup + dup header must be consumed (F3 loop)";
+    EXPECT_EQ(sess.state(), SessionState::Active);
+
+    // Decisive: the peer's next message is in sequence — no phantom RR.
+    const std::size_t before = sent.size();
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::Heartbeat, 3, "CLIENT", "SERVER"));
+    EXPECT_EQ(count_msg_type(sent, msg_types::ResendRequest), 0u);
+    EXPECT_EQ(sent.size(), before);
+}
+
+// Blocker 1: the COMPLETED (mutual) logout must tear the transport down —
+// the F2 contract covers both handle_logout branches, and a late peer Logout
+// after teardown must not double-notify (notify_logout gate).
+TEST(SessionTest, MutualLogoutClosesTransportAndNotifiesOnce) {
+    std::vector<std::string> sent;
+    int disconnect_calls = 0;
+    int logout_calls = 0;
+    std::string logout_reason;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+    cbs.do_disconnect = [&] {
+        ++disconnect_calls;
+    };
+    cbs.on_logout = [&](const SessionID &, std::string_view r) {
+        ++logout_calls;
+        logout_reason = r;
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs);
+    handshake_acceptor(sess);
+    ASSERT_EQ(sess.state(), SessionState::Active);
+
+    ASSERT_TRUE(sess.logout("Bye").has_value());
+    ASSERT_EQ(sess.state(), SessionState::LogoutSent);
+    ASSERT_EQ(disconnect_calls, 0) << "still waiting for the peer's ack";
+
+    // Peer acks our Logout (in sequence: handshake consumed 1, ours is 2).
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::Logout, 2, "CLIENT", "SERVER",
+                              {{tags::Text, "Ack"}}));
+    EXPECT_EQ(sess.state(), SessionState::Disconnected);
+    EXPECT_EQ(disconnect_calls, 1) << "mutual logout must drop the FD (re-verify blocker 1)";
+    EXPECT_EQ(logout_calls, 1);
+    EXPECT_EQ(logout_reason, std::string("Ack"));
+
+    // Late duplicate after teardown: echo may still be attempted, but the
+    // app must NOT see a second on_logout.
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::Logout, 3, "CLIENT", "SERVER"));
+    EXPECT_EQ(logout_calls, 1) << "notify_logout gate suppresses duplicates";
+}
+
+// Adjacent to F4: a ResendRequest without its required BeginSeqNo gets a
+// session Reject instead of a silent drop (the peer's gap stayed unanswered).
+TEST(SessionTest, ResendRequestMissingBeginSeqNoRejected) {
+    std::vector<std::string> sent;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        sent.push_back(s);
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(false), std::move(store), nullptr, cbs);
+    handshake_acceptor(sess);
+    ASSERT_EQ(sess.state(), SessionState::Active);
+
+    MessageBuilder b;
+    b.begin("FIX.4.2", msg_types::ResendRequest);
+    b.add(tags::SenderCompID, "CLIENT");
+    b.add(tags::TargetCompID, "SERVER");
+    b.add(tags::MsgSeqNum, std::int64_t(2));
+    b.add(tags::EndSeqNo, std::int64_t(0)); // required tag 7 absent
+    b.add(tags::SendingTime, "20240101-12:00:00.000");
+    const std::string wire = b.finish();
+    ASSERT_FALSE(wire.empty());
+    feed_wire(sess, wire);
+
+    EXPECT_EQ(count_msg_type(sent, msg_types::Reject), 1u);
+    EXPECT_EQ(count_msg_type(sent, msg_types::SequenceReset), 0u)
+        << "no replay without a BeginSeqNo";
+
+    // The RR was still a normal in-sequence message: consumed, so seq 3 is
+    // in sequence and no phantom gap opens.
+    feed_wire(sess, make_wire("FIX.4.2", msg_types::Heartbeat, 3, "CLIENT", "SERVER"));
+    EXPECT_EQ(count_msg_type(sent, msg_types::ResendRequest), 0u);
+}
+
+// #4: concurrent logon() races must emit exactly ONE Logon frame — the loser
+// hits send_logon's duplicate-initiator guard instead of double-sending (and,
+// with reset_on_logon, double-resetting the store).
+TEST(SessionTest, ConcurrentLogonEmitsSingleLogonFrame) {
+    std::vector<std::string> sent;
+    std::mutex mtx;
+    SessionCallbacks cbs;
+    cbs.do_send = [&](const std::string &s) {
+        std::lock_guard lk(mtx);
+        sent.push_back(s);
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    Session sess(make_cfg(/*initiator=*/true), std::move(store), nullptr, cbs);
+
+    std::atomic<int> oks{0};
+    std::vector<std::thread> threads;
+    threads.reserve(8);
+    for (int i = 0; i < 8; ++i)
+        threads.emplace_back([&] {
+            if (sess.logon().has_value())
+                ++oks;
+        });
+    for (auto &t : threads)
+        t.join();
+
+    std::lock_guard lk(mtx);
+    EXPECT_EQ(count_msg_type(sent, msg_types::Logon), 1u)
+        << "exactly one Logon may leave a racing initiator (#4)";
+    EXPECT_EQ(oks.load(), 1) << "exactly one caller wins the handshake";
+    EXPECT_EQ(sess.state(), SessionState::LogonSent);
+    EXPECT_EQ(sess.store()->next_sender_seq_num(), 2u)
+        << "no second numbering round (double reset would keep this at 1)";
 }

@@ -150,6 +150,9 @@ void Session::on_transport_connected() {
         pending_test_req_id_.clear();
     }
     clear_gap(); // throttle + F9 retry budget of the previous connection
+    // New connection cycle: a previous logout (mutual/timeout/reject) must
+    // not suppress this cycle's on_logout (notify_logout gate).
+    logout_notified_.store(false, std::memory_order_release);
     const Millis now = clock_now();
     last_send_time_ms_.store(now, std::memory_order_relaxed);
     last_recv_time_ms_.store(now, std::memory_order_relaxed);
@@ -166,7 +169,12 @@ void Session::on_transport_connected() {
         if (st != SessionState::NotConnected && st != SessionState::Disconnected) {
             state_.store(SessionState::Disconnected, std::memory_order_release);
         }
-        (void)logon();
+        // A failed re-Logon (store/serialisation) leaves the session
+        // Disconnected on a live socket: surface it instead of discarding —
+        // send_logon already reports its own reset failures, so this can
+        // duplicate one message; silence is the worse outcome.
+        if (auto r = logon(); !r)
+            report(std::string("reconnect: logon failed: ") + r.error().message());
     } else {
         // Acceptor: only WaitingLogon accepts an inbound Logon.
         state_.store(SessionState::WaitingLogon, std::memory_order_release);
@@ -259,7 +267,10 @@ void Session::on_timer() {
         // together with gap_open_ wherever the gap closes (clear_gap()).
         if (gap_open_.load(std::memory_order_acquire)) {
             const auto retry_ms = hb_ms + hb_ms / 5; // 1.2 × HeartBtInt
-            if (n - gap_rr_last_ms_.load(std::memory_order_relaxed) >= retry_ms) {
+            // armed>=1: never retry against an unarmed budget (clear_gap
+            // zeroes it before releasing the flag).
+            const int armed = gap_rr_attempts_.load(std::memory_order_relaxed);
+            if (armed >= 1 && n - gap_rr_last_ms_.load(std::memory_order_relaxed) >= retry_ms) {
                 const int attempt = gap_rr_attempts_.fetch_add(1, std::memory_order_acq_rel) + 1;
                 if (attempt > kMaxGapRetries) {
                     report("sequence gap: ResendRequest retry budget exhausted "
@@ -287,6 +298,11 @@ void Session::on_timer() {
         // flowing while we wait so the peer still sees a live session.
         const auto timeout_ms = static_cast<Millis>(cfg_.logout_timeout) * 1000;
         if (n - logout_sent_time_ms_.load(std::memory_order_relaxed) >= timeout_ms) {
+            // 2.3 + follow-up: the app must learn the session ended here —
+            // it previously only saw on_logout for a *completed* logout and
+            // hung releasing resources after a timed-out one. The
+            // notify_logout gate keeps a late peer Logout from double-firing.
+            notify_logout("logout timeout");
             disconnect();
         } else if (n - last_send_time_ms_.load(std::memory_order_relaxed) >= hb_ms) {
             send_heartbeat();
@@ -329,6 +345,14 @@ void Session::disconnect() {
 }
 
 Result<void> Session::reset() {
+    // Mid-session rewind is a protocol violation: the peer was never told,
+    // so our next outbound seq 1 reads "too low" against their counter (and
+    // an inbound 141 is the only sanctioned reset path). Reset is for
+    // re-arm before (re)connecting / waiting-for-logon only.
+    const auto st = state_.load(std::memory_order_acquire);
+    if (st == SessionState::Active || st == SessionState::LogonSent ||
+        st == SessionState::LogoutSent)
+        return make_unexpected(ErrorCode::SessionError);
     state_.store(SessionState::NotConnected, std::memory_order_release);
     {
         std::lock_guard lock(parser_mtx_);
@@ -340,6 +364,7 @@ Result<void> Session::reset() {
         pending_test_req_id_.clear();
     }
     clear_gap();
+    logout_notified_.store(false, std::memory_order_release);
     if (store_)
         return store_->reset();
     return {};
@@ -575,6 +600,7 @@ void Session::handle_logon(const Message &msg) {
         // otherwise surface as a logon for a dead session.
         const bool sent = send_logon().has_value();
         if (sent && transition(SessionState::WaitingLogon, SessionState::Active)) {
+            logout_notified_.store(false, std::memory_order_release); // new cycle
             if (cbs_.on_logon)
                 guarded([&] { cbs_.on_logon(cfg_.id); });
         } else {
@@ -584,6 +610,7 @@ void Session::handle_logon(const Message &msg) {
     } else if (st == SessionState::LogonSent) {
         // Initiator: the acceptor answered our Logon.
         if (transition(SessionState::LogonSent, SessionState::Active)) {
+            logout_notified_.store(false, std::memory_order_release); // new cycle
             if (cbs_.on_logon)
                 guarded([&] { cbs_.on_logon(cfg_.id); });
         } else {
@@ -610,6 +637,13 @@ void Session::handle_logout(const Message &msg) {
         // Mutual logout complete. CAS: if the timer thread already timed the
         // Logout out, the state is Disconnected and stays there.
         (void)transition(SessionState::LogoutSent, SessionState::Disconnected);
+        // Tear the transport down on THIS branch too — the F2 teardown
+        // contract covers the completed mutual logout, not just the peer-
+        // initiated one. A spec-literal peer that acks our Logout and then
+        // waits for OUR close would otherwise pin the FD forever (on_timer
+        // has no work for Disconnected). Idempotent + one-hop safe for the
+        // same reason documented in the peer-initiated branch below.
+        disconnect();
     } else {
         // Peer initiated: echo the Logout WITHOUT entering LogoutSent (the
         // echo helper only writes the message), then DROP THE CONNECTION —
@@ -626,10 +660,10 @@ void Session::handle_logout(const Message &msg) {
         send_logout_echo();
         disconnect();
     }
-    // Exactly once: neither branch above fires on_logout (disconnect() only
-    // raises do_disconnect), so this is the single invocation.
-    if (cbs_.on_logout)
-        guarded([&] { cbs_.on_logout(cfg_.id, reason); });
+    // At most once per connection cycle: both branches above only reached
+    // here through genuine session end, and a late duplicate (peer Logout
+    // after the timeout path already notified) is suppressed by the gate.
+    notify_logout(reason);
 }
 
 void Session::handle_heartbeat(const Message &msg) {
@@ -656,8 +690,14 @@ void Session::handle_test_request(const Message &msg) {
 void Session::handle_resend_request(const Message &msg) {
     auto begin_opt = msg.get_int(tags::BeginSeqNo);
     auto end_opt = msg.get_int(tags::EndSeqNo);
-    if (!begin_opt)
-        return; // malformed: nothing to replay
+    if (!begin_opt) {
+        // Adjacent to F4: BeginSeqNo is REQUIRED on a ResendRequest — the
+        // old silent drop left the peer's gap unanswered forever. Session
+        // Reject names the missing tag; the request is not replayed.
+        send_reject(msg.seq_num(), SessionRejectReason::RequiredTagMissing,
+                    std::string(msg.msg_type()), tags::BeginSeqNo, "missing BeginSeqNo");
+        return;
+    }
 
     const SeqNum begin = static_cast<SeqNum>(*begin_opt);
     const SeqNum end = end_opt ? static_cast<SeqNum>(*end_opt) : 0;
@@ -847,8 +887,7 @@ void Session::handle_reject(const Message &msg) {
         // logon_timeout only wastes the window. Surface it through on_logout
         // (the session ended) and drop the connection.
         const std::string why = "Logon rejected: " + (info.empty() ? "unknown" : info);
-        if (cbs_.on_logout)
-            guarded([&] { cbs_.on_logout(cfg_.id, why); });
+        notify_logout(why);
         disconnect();
         return;
     }
@@ -914,17 +953,26 @@ void Session::consume_inbound(const Message &msg, bool seq_validated) {
 }
 
 void Session::request_gap(SeqNum begin) {
-    bool open = false;
     // 2.2: at most one ResendRequest per open gap. The flag flips back to
     // false when a message finally lands on the expected sequence (or on
     // disconnect/reset/handshake — clear_gap() there).
-    if (gap_open_.compare_exchange_strong(open, true, std::memory_order_acq_rel,
-                                          std::memory_order_acquire)) {
-        // F9: this is attempt #1 of the gap — start the retry clock and
-        // budget that on_timer() works through (re-send every 1.2xHeartBtInt,
-        // give up after kMaxGapRetries).
+    //
+    // F9 budget is armed BEFORE the CAS flips the flag so a timer tick that
+    // observes gap_open_==true (acquire pairs with this function's release
+    // CAS) can never read an unarmed/stale budget and emit a duplicate RR
+    // against old timestamps. The CAS itself still expects CLOSED (its
+    // expected value must stay literal false — loading the current value
+    // into `open` would make it succeed unconditionally and re-send on
+    // every gap message). A thread whose CAS then fails may re-arm a budget
+    // that is already live — near-simultaneous writes of the same values;
+    // the CAS still gates the send.
+    if (!gap_open_.load(std::memory_order_acquire)) {
         gap_rr_attempts_.store(1, std::memory_order_relaxed);
         gap_rr_last_ms_.store(clock_now(), std::memory_order_relaxed);
+    }
+    bool open = false;
+    if (gap_open_.compare_exchange_strong(open, true, std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
         send_resend_request(begin, 0); // EndSeqNo 0 = "everything"
     }
 }
@@ -948,6 +996,52 @@ Result<void> Session::send_logon() {
     if (!cfg_.default_appl_ver_id.empty())
         m.set(tags::DefaultApplVerID, cfg_.default_appl_ver_id);
 
+    // Serialize guard + store reset + state publish + numbering against
+    // concurrent send()/logon() (#4): send_message() takes this same mutex,
+    // so the locked variant is used below. Lock order is always
+    // send_mutex_ -> store lock (same as every other send path).
+    std::lock_guard lock(send_mutex_);
+
+    const SessionState desired =
+        cfg_.initiator ? SessionState::LogonSent : SessionState::WaitingLogon;
+    const SessionState prev = state_.load(std::memory_order_acquire);
+    if (prev != desired) {
+        // Only a pre-logon state may move onto the wire: never resurrect a
+        // session a concurrent teardown already ended (and never downgrade a
+        // live one). Checked BEFORE the store reset so a rejected attempt
+        // can never rewind a live session's numbering.
+        if (prev != SessionState::NotConnected && prev != SessionState::Disconnected)
+            return make_unexpected(ErrorCode::SessionError);
+    } else if (cfg_.initiator) {
+        // Already LogonSent: a concurrent logon() lost the race — emitting
+        // a second Logon (and, with reset_on_logon, a second store reset
+        // that wipes the first frame's history — both would carry 34=1) is
+        // exactly the #4 hazard. The acceptor legitimately re-enters with
+        // prev == desired (handle_logon responds from WaitingLogon).
+        return make_unexpected(ErrorCode::SessionError);
+    }
+
+    // 2.3 deadline base — written BEFORE the state store (CAS below) so the
+    // timer thread never observes LogonSent with a stale/expired deadline:
+    // state-then-deadline left a window where a tick could see the new state
+    // against the previous connection's deadline and fire logon_timeout
+    // instantly. Harmless on the failure paths: the deadline is only read in
+    // LogonSent, which a failed CAS/rollback never leaves visible.
+    logon_sent_time_ms_.store(clock_now(), std::memory_order_relaxed);
+
+    bool published = false;
+    if (prev != desired) {
+        // F6: publish the handshake state BEFORE the frame hits the wire —
+        // do_send can come back around a loopback faster than this function
+        // returns, and a reply processed while the FSM still read
+        // NotConnected/Disconnected was dropped by handle_logon's "stale
+        // Logon — ignore" branch (handshake then deadlocked till
+        // logon_timeout). CAS: a teardown racing our load wins.
+        if (!transition(prev, desired))
+            return make_unexpected(ErrorCode::SessionError);
+        published = true;
+    }
+
     // F1: 141=Y MUST rewind the store BEFORE the frame is numbered — the old
     // code only tagged the Logon and left the store counting from N+1, so a
     // pre-advanced session emitted "35=A|141=Y|34=501" and the peer's very
@@ -955,42 +1049,26 @@ Result<void> Session::send_logon() {
     // handshake. Both store implementations define reset() as a full
     // re-baseline (seqs -> 1, outbound/inbound history cleared), which is
     // exactly what ResetSeqNumFlag promises. A failed reset must surface, not
-    // silently send a frame that lies about the numbering.
+    // silently send a frame that lies about the numbering. Under send_mutex_
+    // so no concurrent send() can interleave a store_outbound from the old
+    // baseline mid-reset (#4).
     if (do_reset && store_) {
         if (auto r = store_->reset(); !r) {
             report("logon: store reset failed; Logon not sent");
+            if (published)
+                (void)transition(desired, prev); // stay retryable
             return std::unexpected(r.error());
         }
         clear_gap(); // the old numbering's gap/retry state is meaningless now
     }
 
-    // F6: publish the handshake state BEFORE send_message(). do_send can come
-    // back around a loopback faster than this function returns; a reply
-    // processed while the FSM still read NotConnected/Disconnected was
-    // dropped by handle_logon's "stale Logon — ignore" branch and the
-    // handshake then deadlocked until logon_timeout.
-    const SessionState desired =
-        cfg_.initiator ? SessionState::LogonSent : SessionState::WaitingLogon;
-    const SessionState prev = state_.load(std::memory_order_acquire);
-    bool published = false;
-    if (prev != desired) {
-        // Only a pre-logon state may move onto the wire: never resurrect a
-        // session a concurrent teardown already ended (and never downgrade a
-        // live one).
-        if (prev != SessionState::NotConnected && prev != SessionState::Disconnected)
-            return make_unexpected(ErrorCode::SessionError);
-        state_.store(desired, std::memory_order_release);
-        published = true;
-    }
-    // 2.3 deadline base — written before the state so the timer thread
-    // always sees a fresh baseline once LogonSent is visible.
-    logon_sent_time_ms_.store(clock_now(), std::memory_order_relaxed);
-
-    if (auto sent = send_message(m); !sent) {
+    if (auto sent = send_message_locked(m); !sent) {
         // No Logon went out: roll the FSM back so logon() stays retryable
-        // from the pre-logon state and no timer deadline dangles.
+        // from the pre-logon state and no timer deadline dangles. CAS so a
+        // teardown that already moved us to Disconnected is never
+        // resurrected by the rollback.
         if (published)
-            state_.store(prev, std::memory_order_release);
+            (void)transition(desired, prev);
         return std::unexpected(sent.error());
     }
     return {};
@@ -1165,6 +1243,17 @@ void Session::report(std::string_view what) noexcept {
     } catch (...) {
         // The error sink itself must never take an IO/timer thread down.
     }
+}
+
+void Session::notify_logout(std::string_view reason) {
+    // Exchange is the whole gate: the first caller wins, every later caller
+    // for this connection cycle (mutual/peer/logout-timeout/rejected-logon
+    // racing each other) is a no-op. Re-armed in on_transport_connected,
+    // handle_logon (successful Active) and reset().
+    if (logout_notified_.exchange(true, std::memory_order_acq_rel))
+        return;
+    if (cbs_.on_logout)
+        guarded([&] { cbs_.on_logout(cfg_.id, reason); });
 }
 
 const DataDictionary *Session::resolve_dictionary() const {

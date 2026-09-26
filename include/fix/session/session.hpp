@@ -246,6 +246,10 @@ private:
     // Corrupt stored frames skipped during a ResendRequest replay (2.2).
     std::atomic<std::uint64_t> resend_corrupt_{0};
 
+    // on_logout already delivered for the current connection cycle — see
+    // notify_logout(). Re-armed in on_transport_connected/handle_logon/reset.
+    std::atomic<bool> logout_notified_{false};
+
     // -- Heartbeat interval mirror (F2) -------------------------------------
     // cfg_.heartbeat_interval is written by the IO thread (handle_logon) and
     // read by the timer thread (on_timer) and by send_logon (any thread).
@@ -319,20 +323,22 @@ private:
     // Gap throttle: sends a ResendRequest at most once per open gap (the
     // retry cadence for an unanswered request lives in on_timer — F9).
     void request_gap(SeqNum begin);
-    // The ONE place a processed inbound message consumes its sequence slot.
-    // Shared by the dispatch advance and the session-level Reject paths
-    // (missing MsgType, duplicate header tag): a Reject must consume exactly
-    // what an equivalent accepted message would, otherwise an in-sequence
-    // PossDup with a duplicated header is rejected but never consumed and the
-    // reject/resend loop never ends (F3).
+    // The place a processed inbound message consumes its sequence slot,
+    // shared by the dispatch advance and the duplicate-header Reject path:
+    // a Reject must consume exactly what an equivalent accepted message
+    // would, otherwise an in-sequence PossDup with a duplicated header is
+    // rejected but never consumed and the reject/resend loop never ends
+    // (F3). The pre-validation missing-MsgType Reject deliberately does NOT
+    // use this: it keeps its own stricter `seq == expected` gate so a
+    // future-sequence message can never fast-forward the counter.
     void consume_inbound(const Message &msg, bool seq_validated);
 
     // -- State machine (2.4) -------------------------------------------------
     // compare_exchange transition: returns true only if the session was in
     // `expected` and moved to `desired`. Use it wherever a user thread, the
-    // IO thread and the timer thread can race (the plain store in send_logon
-    // is guarded by a predecessor check — the handshake only ever moves a
-    // pre-logon state forward, and send failures roll it back (F6)).
+    // IO thread and the timer thread can race. send_logon() also uses it
+    // (under send_mutex_) so a concurrent duplicate initiator logon loses
+    // the CAS instead of emitting a second Logon with a second store reset.
     bool transition(SessionState expected, SessionState desired);
 
     // -- ResendRequest replay (2.2) -----------------------------------------
@@ -363,6 +369,15 @@ private:
     // Routes to SessionCallbacks::on_error; swallows when unset (no logging
     // infra exists — that is the documented floor, see SessionCallbacks).
     void report(std::string_view what) noexcept;
+
+    // -- Session-end notification -------------------------------------------
+    // Single gate for on_logout: fires the callback at most once per
+    // connection cycle (mutual logout, peer-initiated logout, logout
+    // timeout, rejected handshake). The flag re-arms on transport connect
+    // and on a successful logon, so a later reconnect/logout cycle notifies
+    // again while any late duplicate (e.g. peer Logout arriving after the
+    // timeout already closed us) stays silent.
+    void notify_logout(std::string_view reason);
 
     // -- Dictionary validation (2.7) ----------------------------------------
     // Resolves the DataDictionary for this session's version: the explicitly
