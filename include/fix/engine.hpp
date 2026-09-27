@@ -31,6 +31,10 @@ struct EngineConfig {
     std::filesystem::path log_dir = "./fix_logs";
     bool use_file_store = false;
     bool enable_audit = true;
+    // fsync(2) after every FileStore message append (3.4): crash-safe
+    // frames at one fsync per stored frame; sequence numbers are always
+    // fsynced regardless, so only recent un-fsynced frames can vanish.
+    bool fsync_messages = false;
     int timer_interval_ms = 200; // heartbeat/timer resolution
     std::size_t thread_pool_size = 4;
 
@@ -48,6 +52,15 @@ struct EngineConfig {
 
 // ---------------------------------------------------------------------------
 // Engine – top-level coordinator
+//
+// Lock order (Phase 3, task 3.1): the authoritative statement lives at the
+// top of include/fix/session/session_manager.hpp —
+//     manager → recv → send → store → transport
+// — where "manager" covers both SessionManager::mutex_ and this class's
+// conn_mutex_. Both are top-level registry locks: never nested with each
+// other, never held across a user callback, a join, or an error-sink report
+// (every sweep in src/engine.cpp snapshots under the lock, releases it, then
+// iterates/stops/report).
 // ---------------------------------------------------------------------------
 class Engine {
 public:

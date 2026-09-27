@@ -176,6 +176,9 @@ if(FIX_BUILD_TESTS)
         tests/test_store.cpp
         tests/test_e2e.cpp
         tests/test_e2e_timers.cpp
+        tests/test_transport.cpp
+        tests/test_audit.cpp
+        tests/test_stress.cpp
     )
 
     target_link_libraries(fix_tests

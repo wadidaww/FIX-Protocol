@@ -3,6 +3,8 @@
 // =============================================================================
 #include "fix/session/session_manager.hpp"
 
+#include <vector>
+
 namespace fix {
 
 std::string SessionManager::make_key(const SessionID &sid) {
@@ -62,8 +64,23 @@ bool SessionManager::remove(const SessionID &sid) {
 }
 
 void SessionManager::for_each(std::function<void(Session &)> fn) {
-    std::shared_lock lock(mutex_);
-    for (auto &[key, sess] : sessions_)
+    // 3.1: snapshot under the lock, release it, THEN iterate. The callback
+    // reaches user code and network I/O (timer pass → Session::on_timer →
+    // on_* callbacks / do_send; shutdown pass → logout), and holding
+    // shared_lock across that deadlocked the moment a callback called
+    // create_session()/remove() (unique_lock on the same non-recursive
+    // shared_mutex from the owning thread = UB/deadlock). The shared_ptr
+    // snapshot also keeps a session alive for the whole pass even if another
+    // thread removes it mid-iteration; sessions added concurrently are picked
+    // up by the next pass.
+    std::vector<std::shared_ptr<Session>> snapshot;
+    {
+        std::shared_lock lock(mutex_);
+        snapshot.reserve(sessions_.size());
+        for (const auto &[key, sess] : sessions_)
+            snapshot.push_back(sess);
+    }
+    for (const auto &sess : snapshot)
         fn(*sess);
 }
 

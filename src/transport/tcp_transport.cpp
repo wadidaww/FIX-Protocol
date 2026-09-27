@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <climits>
 #include <cstring>
 #include <stdexcept>
 
@@ -45,31 +46,63 @@ TcpTransport::TcpTransport(TcpTransportConfig cfg)
 
 TcpTransport::~TcpTransport() {
     stop();
+#ifndef _WIN32
+    if (resolved_) {
+        ::freeaddrinfo(resolved_); // IO thread is gone (stop above) – safe now
+        resolved_ = nullptr;
+    }
+#endif
+    close_wake_pipe();
 }
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 Result<void> TcpTransport::start() {
+    // Serialise lifecycle transitions: the forced running_ re-arm below would
+    // otherwise open a window in which a concurrent start() slips past the
+    // CAS and spawns a second IO thread.
+    std::lock_guard lifecycle(lifecycle_mutex_);
+
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
         return {}; // already started – idempotent
+
+    // Join any thread left over from an earlier stop()-from-a-callback FIRST.
+    // Two hazards it closes: (a) that thread may still be inside do_connect()
+    // iterating `resolved_`, which the DNS resolution below replaces; (b) it
+    // may not have observed running_ == false yet — the CAS just re-armed the
+    // flag, which would let it run forever and hang the join. Force the flag
+    // low while we join (every internal wait re-checks it at least every
+    // kPollTimeoutMs) and wake it so it notices promptly.
+    running_.store(false, std::memory_order_release);
+    if (io_thread_.joinable()) {
+        if (io_thread_.get_id() == std::this_thread::get_id()) {
+            return make_unexpected(ErrorCode::TransportError); // running_ stays false
+        }
+        wake();
+        io_thread_.join();
+    }
+    running_.store(true, std::memory_order_release);
+
+    // DNS (3.3): resolve ONCE here, on the caller's thread, before any IO
+    // thread exists. getaddrinfo() used to run inside do_connect() – i.e. on
+    // the IO thread, on EVERY reconnect attempt – so a slow or wedged resolver
+    // stalled the whole transport (reads, disconnect handling and stop()
+    // responsiveness all queued behind the DNS call). The cached address list
+    // is reused for every reconnect; call stop()+start() (or rebuild the
+    // transport) to pick up DNS changes. Resolution failure now fails start()
+    // loudly instead of retrying forever inside the event loop.
+    if (cfg_.initiator && !resolve_target()) {
+        running_.store(false, std::memory_order_release);
+        return make_unexpected(ErrorCode::TransportError);
+    }
 
     if (!create_wake_pipe()) {
         running_.store(false, std::memory_order_release);
         if (on_error_)
             on_error_(make_error_code(ErrorCode::TransportError));
         return make_unexpected(ErrorCode::TransportError);
-    }
-
-    // A previous stop() from a transport callback leaves the thread unjoined;
-    // std::thread assignment would otherwise terminate.
-    if (io_thread_.joinable()) {
-        if (io_thread_.get_id() == std::this_thread::get_id()) {
-            running_.store(false, std::memory_order_release);
-            return make_unexpected(ErrorCode::TransportError);
-        }
-        io_thread_.join();
     }
 
     io_thread_ = std::thread([this] {
@@ -89,8 +122,8 @@ void TcpTransport::stop() {
     running_.store(false, std::memory_order_release);
 
     if (!io_thread_.joinable()) {
-        // Never started (or already stopped).
-        close_wake_pipe();
+        // Never started (or already stopped). The wake pipe is owned by the
+        // object (closed in the destructor), so nothing to release here.
         return;
     }
     if (io_thread_.get_id() == std::this_thread::get_id()) {
@@ -103,7 +136,12 @@ void TcpTransport::stop() {
     }
     wake(); // interrupt epoll_wait()/poll()/backoff sleep
     io_thread_.join();
-    close_wake_pipe(); // only now – nobody can be writing to the pipe anymore
+    // Deliberately NOT closing the wake pipe here: wake() is reachable from
+    // arbitrary threads (disconnect(), a queued send()) that may already have
+    // read the fd – closing it now would race that write (fd reuse) and race
+    // on wake_pipe_[1] itself under TSAN. The pipe survives restart cycles
+    // (create_wake_pipe reuses it) and is closed in the destructor, after
+    // which no other thread may legally touch this transport.
 }
 
 void TcpTransport::disconnect() {
@@ -242,6 +280,30 @@ bool TcpTransport::interruptible_sleep(std::chrono::milliseconds delay) {
 // ---------------------------------------------------------------------------
 // Connecting (initiator)
 // ---------------------------------------------------------------------------
+bool TcpTransport::resolve_target() {
+#ifdef _WIN32
+    return true; // transport bodies are no-ops on Windows
+#else
+    struct addrinfo hints {
+    }, *res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    const std::string port_str = std::to_string(cfg_.port);
+    if (::getaddrinfo(cfg_.host.c_str(), port_str.c_str(), &hints, &res) != 0) {
+        // Surfaced here (caller thread, inside start()) so a bad host name is
+        // a construction-time failure, not a silent IO-thread retry loop.
+        if (on_error_)
+            on_error_(make_error_code(ErrorCode::TransportError));
+        return false;
+    }
+    if (resolved_)
+        ::freeaddrinfo(resolved_); // previous start() cycle; its IO thread is joined
+    resolved_ = res;
+    return true;
+#endif
+}
+
 bool TcpTransport::wait_writable(int fd) {
 #ifdef _WIN32
     (void)fd;
@@ -289,39 +351,32 @@ bool TcpTransport::wait_writable(int fd) {
 #endif
 }
 
-bool TcpTransport::do_connect(const std::string &host, std::uint16_t port) {
+bool TcpTransport::do_connect() {
 #ifdef _WIN32
-    (void)host;
-    (void)port;
     return false;
 #else
-    struct addrinfo hints {
-    }, *res = nullptr;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    const std::string port_str = std::to_string(port);
-    if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0) {
+    // 3.3: NO getaddrinfo() here anymore — the address list was resolved
+    // once in start() on the caller's thread (resolve_target) and is reused
+    // for every reconnect attempt, so the IO thread never blocks on DNS.
+    if (!resolved_) {
+        // Only reachable when resolve_target() failed earlier (start() would
+        // have refused to run) or on a platform where resolution is skipped.
         if (on_error_)
             on_error_(make_error_code(ErrorCode::TransportError));
         return false;
     }
 
     bool established = false;
-    for (struct addrinfo *ai = res;
+    for (struct addrinfo *ai = resolved_;
          ai != nullptr && !established && running_.load(std::memory_order_acquire);
          ai = ai->ai_next) {
         const int fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0)
             continue;
-        if (make_nonblocking(fd) != 0 || tcp_nodelay(fd) != 0) {
+        if (prepare_socket(fd) != 0) {
             ::close(fd);
             continue;
         }
-#ifdef SO_NOSIGPIPE
-        int one = 1;
-        (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-#endif
         const int rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
         if (rc < 0 && errno != EINPROGRESS) {
             ::close(fd);
@@ -350,7 +405,6 @@ bool TcpTransport::do_connect(const std::string &host, std::uint16_t port) {
         fire_disconnected(reason);
         established = true;
     }
-    ::freeaddrinfo(res);
 
     if (!established && running_.load(std::memory_order_acquire) && on_error_)
         on_error_(make_error_code(ErrorCode::TransportError));
@@ -367,7 +421,7 @@ void TcpTransport::run_initiator() {
     const auto delay_max = std::max({delay, cfg_.reconnect_delay_max, ms{1}});
 
     while (running_.load(std::memory_order_acquire)) {
-        const bool established = do_connect(cfg_.host, cfg_.port);
+        const bool established = do_connect(); // uses the cached DNS result
         if (!running_.load(std::memory_order_acquire))
             break;
         if (!interruptible_sleep(delay))
@@ -461,11 +515,12 @@ void TcpTransport::run_acceptor() {
                 (void)interruptible_sleep(kAcceptBackoff);
                 break;
             }
-            (void)make_nonblocking(fd);
-            (void)tcp_nodelay(fd);
-#ifdef SO_NOSIGPIPE
-            (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-#endif
+            if (prepare_socket(fd) != 0) {
+                ::close(fd);
+                if (on_error_)
+                    on_error_(std::error_code(errno, std::system_category()));
+                continue;
+            }
 
             adopt_connection(fd);
             if (on_connected_)
@@ -505,6 +560,14 @@ std::string_view TcpTransport::run_event_loop(int fd) {
 
     // EPOLLRDHUP so a peer half-close is reported even without payload; the
     // wake pipe makes stop() interrupt epoll_wait() immediately.
+    // EPOLLOUT is edge-triggered *for the whole connection lifetime* — the fd
+    // is added once and never EPOLL_CTL_MOD'ed, so there is no "re-arm" step
+    // to miss (3.3). Two backstops cover the cross-thread queue: an edge fires
+    // on every non-writable → writable transition (the queue only survives in
+    // that state), and the unconditional handle_send() after every epoll wake
+    // (plus the 100 ms tick) flushes bytes that were queued while the socket
+    // stayed writable. send() additionally wakes the IO thread when a foreign
+    // thread queues data, so the tick is never the latency floor.
     const bool registered =
         add_fd(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP | EPOLLHUP | EPOLLERR) &&
         (wake_pipe_[0] < 0 || add_fd(wake_pipe_[0], EPOLLIN | EPOLLET));
@@ -530,6 +593,8 @@ std::string_view TcpTransport::run_event_loop(int fd) {
         if (n < 0) {
             if (errno == EINTR)
                 continue;
+            if (on_error_) // 3.3: never tear down silently
+                on_error_(std::error_code(errno, std::system_category()));
             reason = "epoll_wait failed";
             break;
         }
@@ -545,6 +610,20 @@ std::string_view TcpTransport::run_event_loop(int fd) {
                 continue;
             }
             if (evs & (EPOLLHUP | EPOLLERR)) {
+                // 3.3: this branch used to tear the connection down SILENTLY.
+                // A reset peer reports EPOLLERR|EPOLLHUP *together with*
+                // EPOLLIN, and this check runs first — so handle_recv()'s
+                // ECONNRESET reporting never ran and EngineConfig::on_error
+                // never fired for an RST. Read SO_ERROR and surface it;
+                // SO_ERROR == 0 (clean hangup) stays silent so a graceful
+                // close cannot raise a spurious error. (A peer FIN without a
+                // reset reports EPOLLIN|EPOLLRDHUP only and is handled below
+                // as the normal "peer closed" path.)
+                int err = 0;
+                socklen_t err_len = sizeof(err);
+                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == 0 && err != 0 &&
+                    on_error_)
+                    on_error_(std::error_code(err, std::system_category()));
                 reason = "connection error";
                 done = true;
                 break;
@@ -616,6 +695,13 @@ std::string_view TcpTransport::run_event_loop(int fd) {
             continue;
         }
         if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            // 3.3: same as the epoll path — surface a real socket error
+            // (SO_ERROR) before tearing down, stay silent on a clean hangup.
+            int err = 0;
+            socklen_t err_len = sizeof(err);
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == 0 && err != 0 &&
+                on_error_)
+                on_error_(std::error_code(err, std::system_category()));
             reason = "connection error";
             break;
         }
@@ -709,27 +795,43 @@ Result<void> TcpTransport::send(const char *data, std::size_t len) {
     if (!connected_.load(std::memory_order_acquire))
         return make_unexpected(ErrorCode::TransportError);
 #ifndef _WIN32
-    std::lock_guard lock(send_mutex_);
-    if (conn_fd_ < 0)
-        return make_unexpected(ErrorCode::TransportError);
-    if (send_queue_.empty()) {
-        // Try a direct write first; queue whatever did not fit so the event
-        // loop flushes it (the socket is non-writable at this point, which is
-        // exactly what generates the next edge-triggered EPOLLOUT).
-        ssize_t n;
-        do {
-            n = ::send(conn_fd_, data, len, send_flags());
-        } while (n < 0 && errno == EINTR);
-        if (n < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
-                return make_unexpected(ErrorCode::TransportError);
-            n = 0;
+    bool queued = false;
+    {
+        std::lock_guard lock(send_mutex_);
+        if (conn_fd_ < 0)
+            return make_unexpected(ErrorCode::TransportError);
+        if (send_queue_.empty()) {
+            // Try a direct write first; queue whatever did not fit so the event
+            // loop flushes it (the socket is non-writable at this point, which is
+            // exactly what generates the next edge-triggered EPOLLOUT).
+            ssize_t n;
+            do {
+                n = ::send(conn_fd_, data, len, send_flags());
+            } while (n < 0 && errno == EINTR);
+            if (n < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    return make_unexpected(ErrorCode::TransportError);
+                n = 0;
+            }
+            if (static_cast<std::size_t>(n) < len) {
+                send_queue_.emplace_back(data + n, len - static_cast<std::size_t>(n));
+                queued = true;
+            }
+        } else {
+            send_queue_.emplace_back(data, len);
+            queued = true;
         }
-        if (static_cast<std::size_t>(n) < len)
-            send_queue_.emplace_back(data + n, len - static_cast<std::size_t>(n));
-    } else {
-        send_queue_.emplace_back(data, len);
     }
+    // 3.3: cross-thread flush kick. Edge-triggered EPOLLOUT only fires on a
+    // non-writable → writable TRANSITION, so bytes appended right after the IO
+    // thread's flush pass (queue drained, socket still writable) produce no
+    // further edge and would sit until the 100 ms loop tick. A wake byte makes
+    // the IO thread re-run its unconditional handle_send() immediately. From
+    // the IO thread itself no wake is needed: the loop flushes after the
+    // current event batch anyway (and writing the pipe here would just be a
+    // wasted syscall per frame).
+    if (queued && !on_io_thread())
+        wake();
 #else
     (void)data;
     (void)len;
@@ -807,11 +909,126 @@ int TcpTransport::tcp_nodelay(int fd) {
 #endif
 }
 
+int TcpTransport::apply_keepalive(int fd) {
+#ifndef _WIN32
+    const int one = 1;
+    if (::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0)
+        return -1;
+        // Knob names differ per platform; all guarded so a missing one degrades to
+        // the kernel default rather than failing the connection.
+#ifdef TCP_KEEPIDLE
+    (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &kKeepIdleSec, sizeof(kKeepIdleSec));
+#elif defined(TCP_KEEPALIVE) // macOS/BSD spell the *idle* time differently
+    (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &kKeepIdleSec, sizeof(kKeepIdleSec));
+#endif
+#ifdef TCP_KEEPINTVL
+    (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &kKeepIntvlSec, sizeof(kKeepIntvlSec));
+#endif
+#ifdef TCP_KEEPCNT
+    (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &kKeepCnt, sizeof(kKeepCnt));
+#endif
+    return 0;
+#else
+    (void)fd;
+    return 0;
+#endif
+}
+
+int TcpTransport::prepare_socket(int fd) {
+    if (make_nonblocking(fd) != 0 || tcp_nodelay(fd) != 0)
+        return -1;
+#ifndef _WIN32
+    // Send buffer (TcpTransportConfig::send_buffer_size): applied explicitly so
+    // it is deterministic (kernel autotuning is disabled once SO_SNDBUF is set
+    // explicitly) — and so the cross-thread queue test can force backpressure.
+    if (cfg_.send_buffer_size > 0) {
+        const auto requested =
+            std::min<std::size_t>(cfg_.send_buffer_size, static_cast<std::size_t>(INT_MAX));
+        const int sz = static_cast<int>(requested);
+        (void)::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+    }
+#ifdef SO_NOSIGPIPE
+    // Per-socket SIGPIPE suppression (3.7) for platforms without
+    // MSG_NOSIGNAL (macOS/BSD). Applied to BOTH connection types here.
+    int one = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+    (void)apply_keepalive(fd); // 3.3 backstop liveness probe
+#endif
+    return 0;
+}
+
+Result<TcpTransport::SocketOptions> TcpTransport::socket_options() const {
+#ifdef _WIN32
+    return make_unexpected(ErrorCode::TransportError);
+#else
+    // Held across the getsockopt calls only: send_mutex_ excludes
+    // close_connection(), so the fd cannot be recycled under us.
+    std::lock_guard lock(send_mutex_);
+    if (conn_fd_ < 0)
+        return make_unexpected(ErrorCode::TransportError);
+
+    SocketOptions opts;
+    int v = 0;
+    socklen_t len = sizeof(v);
+    if (::getsockopt(conn_fd_, SOL_SOCKET, SO_KEEPALIVE, &v, &len) != 0)
+        return make_unexpected(ErrorCode::TransportError);
+    opts.keepalive = v != 0;
+
+    v = 0;
+    len = sizeof(v);
+    if (::getsockopt(conn_fd_, IPPROTO_TCP, TCP_NODELAY, &v, &len) != 0)
+        return make_unexpected(ErrorCode::TransportError);
+    opts.nodelay = v != 0;
+
+    v = 0;
+    len = sizeof(v);
+    if (::getsockopt(conn_fd_, SOL_SOCKET, SO_SNDBUF, &v, &len) == 0)
+        opts.send_buffer_bytes = v;
+
+#ifdef TCP_KEEPIDLE
+    v = 0;
+    len = sizeof(v);
+    if (::getsockopt(conn_fd_, IPPROTO_TCP, TCP_KEEPIDLE, &v, &len) == 0)
+        opts.keepidle_sec = v;
+#elif defined(TCP_KEEPALIVE)
+    v = 0;
+    len = sizeof(v);
+    if (::getsockopt(conn_fd_, IPPROTO_TCP, TCP_KEEPALIVE, &v, &len) == 0)
+        opts.keepidle_sec = v;
+#endif
+#ifdef TCP_KEEPINTVL
+    v = 0;
+    len = sizeof(v);
+    if (::getsockopt(conn_fd_, IPPROTO_TCP, TCP_KEEPINTVL, &v, &len) == 0)
+        opts.keepintvl_sec = v;
+#endif
+#ifdef TCP_KEEPCNT
+    v = 0;
+    len = sizeof(v);
+    if (::getsockopt(conn_fd_, IPPROTO_TCP, TCP_KEEPCNT, &v, &len) == 0)
+        opts.keepcnt = v;
+#endif
+    return opts;
+#endif
+}
+
 int TcpTransport::send_flags() noexcept {
 #ifdef MSG_NOSIGNAL
-    return MSG_NOSIGNAL; // never raise SIGPIPE on a half-open peer
+    // Linux: every ::send() (handle_send + the direct write in send()) carries
+    // MSG_NOSIGNAL so a half-open/reset peer can never raise SIGPIPE — and the
+    // library must never die because an application forgot to ignore it.
+    return MSG_NOSIGNAL;
 #else
-    return 0; // macOS/BSD: SO_NOSIGPIPE is set on the socket instead
+    // macOS/BSD have no MSG_NOSIGNAL: SO_NOSIGPIPE is set on every connection
+    // socket instead (prepare_socket, both accepted and initiated), which
+    // suppresses SIGPIPE per-socket with the same effect. Platforms with
+    // NEITHER mechanism (Windows has no SIGPIPE at all — writes fail with
+    // WSAECONNRESET instead): suppressing SIGPIPE process-wide
+    // (signal(SIGPIPE, SIG_IGN) / sigaction) is the APPLICATION's
+    // responsibility. The library deliberately does NOT install signal
+    // handlers — a library must not touch the process signal disposition.
+    return 0;
 #endif
 }
 

@@ -85,6 +85,10 @@ struct TcpTransportConfig {
     std::string tls_key;
     std::string tls_ca;
     std::size_t recv_buffer_size = 65536;
+    // Applied as SO_SNDBUF on every connection socket (accepted + initiated).
+    // Explicitly setting it disables kernel send autotuning — pick a value
+    // that covers the peer's window for your link. 0 leaves the kernel
+    // default/autotuning in place.
     std::size_t send_buffer_size = 65536;
     int backlog = 128; // for acceptors
 

@@ -69,9 +69,10 @@ Result<void> Engine::start() {
             // A throw here (std or not) must not unwind out of the thread
             // entry (std::terminate) nor starve the other sessions: catch per
             // session, keep ticking, report afterwards. Reporting is deferred
-            // until after for_each() returns so the sink never runs while
-            // SessionManager's shared_lock is held (a sink calling
-            // add/remove_session would deadlock on that same mutex).
+            // until after for_each() returns so the sink never runs inside the
+            // session pass (3.1: for_each only takes SessionManager's lock to
+            // snapshot the list, but a sink re-entering the Engine — e.g.
+            // add/remove_session — must still not run mid-iteration).
             std::error_code cb_error;
             try {
                 sessions_.for_each([&cb_error](Session &s) {
@@ -135,7 +136,9 @@ void Engine::stop() {
     // std::exception per inbound message deeper down, so a throw here would
     // abort Engine::stop() halfway and leave IO threads unjoined (wedged
     // process). Catch per session, never rethrow, report after for_each()
-    // returns so the sink runs without SessionManager's shared_lock held.
+    // returns so the sink runs outside the session pass (3.1: for_each
+    // snapshots under SessionManager's lock and iterates lock-free, but the
+    // sink is still deferred to keep user code out of the iteration).
     std::error_code cb_error;
     try {
         sessions_.for_each([&cb_error](Session &s) {
@@ -238,7 +241,16 @@ Session *Engine::add_session(SessionConfig cfg, std::unique_ptr<ITransport> tran
     // Create store
     std::unique_ptr<IMessageStore> store;
     if (cfg_.use_file_store) {
-        store = std::make_unique<FileStore>(cfg_.store_dir, cfg.id);
+        // 3.4: open() is the non-throwing path — a corrupt/truncated seq
+        // file REFUSES to start the session (StoreError) instead of the
+        // legacy ctor's silent reset to 1 (sequence-hijack finding C10).
+        auto fs = FileStore::open(cfg_.store_dir, cfg.id,
+                                  {.fsync_messages = cfg_.fsync_messages});
+        if (!fs) {
+            report_error(cfg_.on_error, fs.error());
+            return nullptr;
+        }
+        store = std::move(*fs);
     } else {
         store = std::make_unique<MemoryStore>();
     }
@@ -247,6 +259,9 @@ Session *Engine::add_session(SessionConfig cfg, std::unique_ptr<ITransport> tran
         sessions_.create_session(std::move(cfg), std::move(store), dict, std::move(internal_cbs));
     if (!session)
         return nullptr; // duplicate SessionID – never silently replace
+    // 3.5: RX/TX audit wiring — without this, production sessions silently
+    // used NullAuditLog (sessions in unit tests were wired directly).
+    session->set_audit_log(audit_log_.get());
 
     // Wire transport → session. Callbacks capture a weak_ptr: a session that is
     // removed while the transport IO thread is still draining cannot be

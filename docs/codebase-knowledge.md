@@ -78,9 +78,14 @@ ITransport (TcpTransport)  ← 1 thread per transport, epoll ET (Linux) / busy-p
 | App/user | `Session::send/logon/logout/disconnect/reset`, `Engine::add/remove_session` |
 | Engine timer (200 ms) | `Engine` timer loop → `Session::on_timer` (heartbeats, timeouts, gap retry, user cb). `SessionManager::tick_all` was deleted as dead code (F10) |
 | Transport IO (1/transport) | `Session::on_data` → full admin/app dispatch, replies, user callbacks |
-| `Engine::stop()` / dtor | `logout()` via `for_each` |
+| `Engine::stop()` / dtor | `logout()` via `for_each` (snapshot-then-iterate since 3.1 — the registry lock is **not** held across the logout/user callbacks) |
 
 A single `Session` is touched by ≥3 threads. Only outbound path has `send_mutex_`.
+**Lock order (3.1, authoritative statement)**: `manager → recv → send → store → transport`,
+documented at the top of `include/fix/session/session_manager.hpp` (cross-referenced in
+`include/fix/engine.hpp`); rules: never hold manager/store/send across a user callback,
+snapshot before you iterate; `Session::send_message` holding `send_mutex_` across the
+`do_send` transport *enqueue* is the explicitly accepted boundary.
 
 ---
 
@@ -184,9 +189,9 @@ A single `Session` is touched by ≥3 threads. Only outbound path has `send_mute
 | store seq compound ops | IO (`handle_logon:222-223`) | user (`send`) |
 | `conn_fd_/epoll_fd_/listen_fd_` (plain int) | `stop()`/`send()` caller | IO thread |
 
-- **Deadlock hazard**: `SessionManager::for_each` holds `shared_lock` across `on_timer` → user callbacks + network I/O (`session_manager.cpp:53-57`); callback calling `add_session/remove_session` (unique_lock same mutex) = recursive `shared_mutex` lock → UB/deadlock.
-- Lock order inversion: resend path takes `store mutex → transport mutex` (no `send_mutex_`); send path takes `send_mutex_ → store → transport`.
-- `do_send` invoked **while `send_mutex_` held** → blocking/reentrant user callback stalls all senders or deadlocks (non-recursive mutex).
+- ~~**Deadlock hazard**: `SessionManager::for_each` holds `shared_lock` across `on_timer` → user callbacks + network I/O; callback calling `add_session/remove_session` (unique_lock same mutex) = recursive `shared_mutex` lock → UB/deadlock.~~ **FIXED (3.1)**: `for_each` snapshots the `shared_ptr` list under the lock, releases it, then iterates; `session_manager.cpp` + regression test `LockOrder.ForEachAllowsManagerMutationFromCallback`.
+- Lock ordering (audit 3.1): resend path snapshots the store **before** taking `send_mutex_` (no `store → send` nesting); send path takes `send_mutex_ → store → transport` — all consistent with the documented order `manager → recv → send → store → transport`.
+- `do_send` invoked **while `send_mutex_` held**: kept as the documented *accepted boundary* (3.1) — it is the transport enqueue (bounded, non-blocking, no user code) that establishes `send → transport` ordering; user callbacks (`SessionCallbacks::on_*`, `EngineConfig` hooks) were audited to run with no manager/store/send lock held.
 - User `on_message` throwing inside `on_data` catch skips `incr_target_seq_num` → next message looks like gap → ResendRequest storm. Timer-thread callback exceptions → `std::terminate`.
 
 ### Transport
@@ -323,7 +328,7 @@ A single `Session` is touched by ≥3 threads. Only outbound path has `send_mute
 | Resend no PossDup | `src/session/session.cpp:288-293` |
 | Store Result discarded | `src/session/session.cpp:437`, `:175` |
 | Dict validation dead | `src/session/session.cpp:40`; `include/fix/session/session.hpp:36` |
-| Deadlock: cb under manager lock | `src/session/session_manager.cpp:53-61` |
+| ~~Deadlock: cb under manager lock~~ fixed by snapshot `for_each` (3.1) | `src/session/session_manager.cpp` (`for_each`), statement in `include/fix/session/session_manager.hpp` |
 | Timing races | `src/session/session.cpp:146` vs `:108`, `:218` vs `:101` |
 | add_session after start | `src/engine.cpp:40-45` vs `:71-110` |
 | Duplicate ctest | `CMakeLists.txt:184,186` |

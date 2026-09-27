@@ -23,6 +23,8 @@
 
 namespace fix {
 
+class IAuditLog; // log/message_log.hpp — included by session.cpp
+
 // ---------------------------------------------------------------------------
 // Session configuration
 // ---------------------------------------------------------------------------
@@ -112,6 +114,10 @@ public:
     explicit Session(SessionConfig cfg, std::unique_ptr<IMessageStore> store,
                      const DataDictionary *dict = nullptr, SessionCallbacks cbs = {});
 
+    // Closes the owned message store explicitly (3.4: flush + fsync +
+    // close, idempotent) — the store destructor is only the fallback.
+    // Deliberately NOT done in disconnect(): a dropped connection must keep
+    // the store usable for the reconnect that follows.
     ~Session();
 
     // Called by transport layer when bytes arrive
@@ -153,6 +159,22 @@ public:
     // concurrent traffic) — the previous source is dropped immediately.
     void set_time_source_for_test(std::function<Millis()> clock);
 
+    // -- Audit log wiring (3.5) ---------------------------------------------
+    // Records EVERY inbound frame as received (before identity/sequence
+    // validation — a rejected CompID/BeginString frame is exactly what an
+    // audit trail must capture) and every outbound frame handed to the
+    // transport. Pass nullptr (default) to disable auditing. The pointer is
+    // stored atomically so it is TSAN-clean even if wired slightly late,
+    // but the contract is: wire it BEFORE the session is driven (Engine
+    // does this immediately after construction, before the transport
+    // starts). The Session does NOT own the log — the Engine keeps it
+    // alive for the whole engine lifetime (stop() joins all IO threads
+    // before the members are destroyed).
+    void set_audit_log(IAuditLog *log) noexcept { audit_.store(log, std::memory_order_release); }
+    [[nodiscard]] IAuditLog *audit_log() const noexcept {
+        return audit_.load(std::memory_order_acquire);
+    }
+
     // Getters
     [[nodiscard]] const SessionID &id() const noexcept { return cfg_.id; }
     [[nodiscard]] SessionState state() const noexcept { return state_.load(); }
@@ -184,6 +206,14 @@ private:
     std::atomic<std::uint64_t> msgs_sent_{0};
     std::atomic<std::uint64_t> msgs_received_{0};
     std::atomic<std::uint64_t> errors_{0};
+
+    // Audit sink (3.5): see set_audit_log(). Never dereferenced without a
+    // prior null check; atomic so wiring races are impossible under TSAN.
+    std::atomic<IAuditLog *> audit_{nullptr};
+    // Emits one audit entry; never throws into the session path (an audit
+    // backend failure is routed to on_error via report(), it cannot break
+    // message processing).
+    void audit_frame(bool outbound, std::string_view raw) noexcept;
 
     mutable std::mutex send_mutex_;
 

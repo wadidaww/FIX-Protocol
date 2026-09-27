@@ -22,6 +22,8 @@
 // =============================================================================
 #include "fix/session/session.hpp"
 
+#include "fix/log/message_log.hpp" // IAuditLog / AuditEntry (3.5)
+
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -64,7 +66,35 @@ Session::Session(SessionConfig cfg, std::unique_ptr<IMessageStore> store,
     logon_sent_time_ms_.store(t, std::memory_order_relaxed);
 }
 
-Session::~Session() = default;
+Session::~Session() {
+    // 3.4: explicit store close (flush + fsync + close, idempotent). The
+    // FileStore destructor runs right after and is only the fallback for
+    // direct users of the store. Never done on disconnect(): the same store
+    // must stay usable across reconnects.
+    if (store_) {
+        try {
+            (void)store_->close();
+        } catch (...) {
+            // A destructor must never throw.
+        }
+    }
+}
+
+void Session::audit_frame(bool outbound, std::string_view raw) noexcept {
+    // 3.5: single funnel for the audit trail. Never throws into the
+    // RX/TX path — an audit backend failure surfaces through report()
+    // (on_error + error counter) instead of aborting message processing.
+    IAuditLog *log = audit_.load(std::memory_order_acquire);
+    if (!log)
+        return;
+    try {
+        log->log(AuditEntry{Clock::now(), cfg_.id.to_string(), outbound, std::string(raw)});
+    } catch (const std::exception &e) {
+        report(std::string("audit log: entry dropped: ") + e.what());
+    } catch (...) {
+        report("audit log: entry dropped (unknown exception)");
+    }
+}
 
 Session::Millis Session::now_ms() noexcept {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
@@ -195,6 +225,7 @@ Result<void> Session::send_raw(const std::string &raw) {
     std::lock_guard lock(send_mutex_);
     if (cbs_.do_send)
         cbs_.do_send(raw);
+    audit_frame(true, raw); // TX (3.5): raw frames hit the wire too
     last_send_time_ms_.store(clock_now(), std::memory_order_relaxed);
     ++msgs_sent_;
     return {};
@@ -374,6 +405,16 @@ Result<void> Session::reset() {
 // Message processing
 // ---------------------------------------------------------------------------
 void Session::process_message(const Message &msg) {
+    // --- Audit (3.5): record the frame EXACTLY as received, FIRST ----------
+    // Deliberately before identity/sequence validation: a frame with a bad
+    // CompID or BeginString is a potential hijack attempt, and a rejected
+    // frame that never reaches the audit trail is worthless forensically.
+    // The parser has already framed + checksum-validated the bytes (frames
+    // that fail framing never reach process_message — documented limit),
+    // so what is audited here is every fully-framed inbound message,
+    // including every one we go on to reject.
+    audit_frame(false, msg.raw());
+
     // 2.3: ANY inbound traffic proves the peer is alive — clear the pending
     // TestRequest unconditionally. The old TestReqID-only match left the flag
     // stuck after any other inbound message, arming a spurious disconnect in
@@ -414,8 +455,13 @@ void Session::process_message(const Message &msg) {
                                    st != SessionState::LogonSent &&
                                    st != SessionState::NotConnected;
         if (seq_validated && !msg.poss_dup() && msg.seq_num() == store_->next_target_seq_num()) {
-            store_->incr_target_seq_num();
-            store_->store_inbound(msg.seq_num(), msg.raw());
+            // 3.2: atomic compound advance replaces the checked
+            // next_target + incr pair (same value: received == expected, so
+            // next_target becomes received + 1).
+            if (auto r = store_->advance_next_target_seq_num(msg.seq_num() + 1); !r)
+                report("reject: NextTargetMsgSeqNum advance failed");
+            if (auto r = store_->store_inbound(msg.seq_num(), msg.raw()); !r)
+                report("reject: inbound audit persist failed");
         }
         send_reject(msg.seq_num(), SessionRejectReason::RequiredTagMissing, "", tags::MsgType,
                     "Missing MsgType");
@@ -586,7 +632,10 @@ void Session::handle_logon(const Message &msg) {
     // store_->reset() BEFORE the frame is numbered (F1), never here.
     const bool reset_flag = msg.get(tags::ResetSeqNumFlag).value_or("N") == "Y";
     if (reset_flag && (st == SessionState::WaitingLogon || st == SessionState::LogonSent)) {
-        store_->set_next_target_seq_num(1);
+        // Persist failure must surface (3.4): a NextTarget that only lives
+        // in memory desyncs from the disk state after a restart.
+        if (auto r = store_->set_next_target_seq_num(1); !r)
+            report("logon: ResetSeqNumFlag baseline persist failed");
     }
 
     // Whatever gap we were chasing is superseded by a completed handshake
@@ -852,7 +901,8 @@ bool Session::handle_sequence_reset(const Message &msg) {
             disconnect();
             return true;
         }
-        store_->set_next_target_seq_num(static_cast<SeqNum>(*new_seq_opt));
+        if (auto r = store_->set_next_target_seq_num(static_cast<SeqNum>(*new_seq_opt)); !r)
+            report("sequence reset: NewSeqNo persist failed");
         clear_gap(); // the fill landed: throttle + F9 retry budget go too
         return true;
     }
@@ -867,7 +917,8 @@ bool Session::handle_sequence_reset(const Message &msg) {
         disconnect();
         return true;
     }
-    store_->set_next_target_seq_num(static_cast<SeqNum>(*new_seq_opt));
+    if (auto r = store_->set_next_target_seq_num(static_cast<SeqNum>(*new_seq_opt)); !r)
+        report("sequence reset: NewSeqNo persist failed");
     clear_gap(); // reset landed: throttle + F9 retry budget go too
     return true;
 }
@@ -947,9 +998,16 @@ void Session::consume_inbound(const Message &msg, bool seq_validated) {
         return;
     const SeqNum received = msg.seq_num();
     const SeqNum next = received + 1;
-    if (next > store_->next_target_seq_num())
-        store_->set_next_target_seq_num(next);
-    store_->store_inbound(received, msg.raw()); // audit trail; best-effort
+    // 3.2: ONE atomic monotonic advance instead of the racy
+    // `if (next > next_target()) set_next_target(next)` pair. Rewinds are
+    // impossible here by construction (advance never moves backwards).
+    if (auto r = store_->advance_next_target_seq_num(next); !r)
+        report("consume: NextTargetMsgSeqNum advance failed");
+    // Inbound audit trail (3.4): a persist failure is surfaced, not
+    // swallowed — the store may have lost the frame the peer will later
+    // ask us to prove we received.
+    if (auto r = store_->store_inbound(received, msg.raw()); !r)
+        report("consume: inbound audit persist failed");
 }
 
 void Session::request_gap(SeqNum begin) {
@@ -1172,31 +1230,56 @@ Result<void> Session::send_message(Message &msg) {
 }
 
 Result<void> Session::send_message_locked(Message &msg) {
-    SeqNum seq = store_->next_sender_seq_num();
+    // 3.2: atomic claim — one indivisible read-and-advance instead of the
+    // old `next_sender_seq_num()` read + `incr_sender_seq_num()` pair (two
+    // concurrent senders could read the same value before either bumped).
+    // On error nothing was consumed: FileStore rolls its own advance back
+    // before reporting, so a failed seq persist cannot burn a sequence.
+    auto claimed = store_->next_sender_seq_num_incr();
+    if (!claimed)
+        return std::unexpected(claimed.error());
+    const SeqNum seq = *claimed;
+
+    // The claim is rolled back if the frame cannot go out (serialisation or
+    // store failure), preserving the ORIGINAL error for the caller. Safe
+    // because every caller of send_message_locked holds send_mutex_ — no
+    // other claim from this session can interleave in between (so the
+    // session-local rollback can restore the exact value without clobbering
+    // a concurrent claim).
+    auto abort_with = [&](std::error_code original) -> std::error_code {
+        if (auto r = store_->set_next_sender_seq_num(seq); !r)
+            report("send: sequence rollback failed after a send abort");
+        return original;
+    };
+
     auto bs = fix::to_string(cfg_.id.version);
     auto ts = MessageBuilder::format_timestamp_now();
 
     // Strict serialization (F5): try_serialize() surfaces the first rejected
     // field (e.g. an SOH smuggled in through Message::fields()) instead of
-    // returning "". The error must be returned BEFORE the sequence number is
-    // stored/incremented — the old code stored an empty wire frame, bumped
-    // the sender seq and sent nothing, leaving a permanent gap.
+    // returning "". The sequence is rolled back when it fails — the old
+    // code stored an empty wire frame, bumped the sender seq and sent
+    // nothing, leaving a permanent gap.
     auto wire =
         builder_.try_serialize(msg, bs, seq, cfg_.id.senderCompID, cfg_.id.targetCompID, ts);
     if (!wire)
-        return std::unexpected(wire.error());
+        return std::unexpected(abort_with(wire.error()));
 
-    // 2.6: check store_outbound BEFORE incrementing. A failed persist means
-    // the frame cannot be resent later, so burning the sequence here would
-    // leave a permanent hole — abort the send with the real error instead
+    // 2.6: store_outbound must succeed BEFORE the frame is handed to the
+    // transport. A failed persist means the frame cannot be resent later,
+    // so the claim is rolled back and the send aborts with the real error
     // (the old code discarded the Result and always returned {}).
     auto stored = store_->store_outbound(seq, *wire);
     if (!stored)
-        return std::unexpected(stored.error());
-    store_->incr_sender_seq_num();
+        return std::unexpected(abort_with(stored.error()));
 
     if (cbs_.do_send)
         cbs_.do_send(*wire);
+    // TX audit (3.5): record the frame we just handed to the transport.
+    // Transport-level failures surface asynchronously via the engine's
+    // on_error sink (do_send is void) — the audit reflects what Session
+    // emitted.
+    audit_frame(true, *wire);
 
     last_send_time_ms_.store(clock_now(), std::memory_order_relaxed);
     ++msgs_sent_;
@@ -1209,6 +1292,7 @@ void Session::emit_wire_locked(std::string_view wire) {
     // already-numbered message (a gap-fill or a PossDup re-tagged app msg).
     if (cbs_.do_send)
         cbs_.do_send(std::string(wire));
+    audit_frame(true, wire); // TX (3.5): replayed frames hit the wire too
     last_send_time_ms_.store(clock_now(), std::memory_order_relaxed);
     ++msgs_sent_;
 }

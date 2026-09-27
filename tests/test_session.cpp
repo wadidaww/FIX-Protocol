@@ -642,10 +642,29 @@ class FlakyStore : public IMessageStore {
 public:
     SeqNum next_sender_seq_num() const noexcept override { return sender_; }
     SeqNum next_target_seq_num() const noexcept override { return target_; }
-    void set_next_sender_seq_num(SeqNum n) override { sender_ = n; }
-    void set_next_target_seq_num(SeqNum n) override { target_ = n; }
-    void incr_sender_seq_num() override { ++sender_; }
-    void incr_target_seq_num() override { ++target_; }
+    Result<void> set_next_sender_seq_num(SeqNum n) override {
+        sender_ = n;
+        return {};
+    }
+    Result<void> set_next_target_seq_num(SeqNum n) override {
+        target_ = n;
+        return {};
+    }
+    Result<void> incr_sender_seq_num() override {
+        ++sender_;
+        return {};
+    }
+    Result<void> incr_target_seq_num() override {
+        ++target_;
+        return {};
+    }
+    // 3.2 compound primitives (session send path uses the claim variant)
+    Result<SeqNum> next_sender_seq_num_incr() override { return sender_++; }
+    Result<void> advance_next_target_seq_num(SeqNum n) override {
+        if (n > target_)
+            target_ = n;
+        return {};
+    }
     Result<void> store_outbound(SeqNum, const std::string &) override {
         return fail_outbound ? make_unexpected(ErrorCode::StoreError) : Result<void>{};
     }
