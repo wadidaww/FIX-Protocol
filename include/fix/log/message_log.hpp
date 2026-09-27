@@ -15,6 +15,9 @@
 //  * The async queue is BOUNDED (Config::max_queue): under a flood the
 //    excess entries are dropped and COUNTED (dropped()), never allowed to
 //    grow the queue without limit.
+//  * A failed append (ENOSPC/EIO) is COUNTED (write_errors()) and the
+//    stream latch is cleared, so one disk error cannot silently swallow
+//    every later entry for the rest of the run (NIT#7).
 //  * flush() is thread-safe: it waits for the writer thread to drain the
 //    queue and fsync-free flush the file — the caller never touches the
 //    stream that the writer owns (the old flush() raced the writer on
@@ -86,12 +89,22 @@ public:
     void flush() override;
     void rotate() override;
 
-    // Entries dropped because the bounded queue was full (3.5). Readable
-    // from any thread; polled by the engine's error path (wiring note: the
-    // Engine timer loop can compare against its last sample and report a
+    // Entries dropped because the bounded queue was full (3.5), or because
+    // the file was not open when the entry arrived. Readable from any
+    // thread; polled by the engine's error path (wiring note: the Engine
+    // timer loop can compare against its last sample and report a
     // StoreError on EngineConfig::on_error when it increases).
     [[nodiscard]] std::uint64_t dropped() const noexcept {
         return dropped_.load(std::memory_order_acquire);
+    }
+    // Append attempts that FAILED at the stream (NIT#7): ENOSPC/EIO left the
+    // stream latched bad and entries silently vanished before this counter
+    // existed. write_entry() counts them and clears the latch so later
+    // entries are attempted again. Breakdown with dropped(): dropped_ =
+    // "never attempted" (queue full / no file open), write_errors_ =
+    // "attempted, the filesystem rejected it".
+    [[nodiscard]] std::uint64_t write_errors() const noexcept {
+        return write_errors_.load(std::memory_order_acquire);
     }
     // Path of the file currently being written (diagnostics/tests).
     [[nodiscard]] std::filesystem::path current_file() const;
@@ -115,6 +128,7 @@ private:
     std::uint64_t flush_req_ = 0;  // queue_mutex_
     std::uint64_t flush_done_ = 0; // queue_mutex_
     std::atomic<std::uint64_t> dropped_{0};
+    std::atomic<std::uint64_t> write_errors_{0}; // see write_errors()
 
     void write_loop();
     void write_entry(const AuditEntry &e); // takes file_mutex_

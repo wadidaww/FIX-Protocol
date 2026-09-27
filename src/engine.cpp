@@ -48,6 +48,10 @@ Engine::Engine(EngineConfig cfg)
     } else {
         audit_log_ = std::make_unique<NullAuditLog>();
     }
+    // MUST#1b: one queue for every session's do_send wiring (see
+    // DeferredErrorSink). Holds a COPY of the sink — the queue outlives this
+    // Engine when a quarantined session drains after stop().
+    deferred_errors_ = std::make_shared<DeferredErrorSink>(cfg_.on_error);
 }
 
 Engine::~Engine() {
@@ -68,11 +72,16 @@ Result<void> Engine::start() {
             // only catches std::exception per *inbound message* deeper down.
             // A throw here (std or not) must not unwind out of the thread
             // entry (std::terminate) nor starve the other sessions: catch per
-            // session, keep ticking, report afterwards. Reporting is deferred
-            // until after for_each() returns so the sink never runs inside the
-            // session pass (3.1: for_each only takes SessionManager's lock to
-            // snapshot the list, but a sink re-entering the Engine — e.g.
-            // add/remove_session — must still not run mid-iteration).
+            // session, keep ticking, report afterwards. Reporting the TICK's
+            // own backstop error is deferred until after for_each() returns so
+            // it never runs inside the session pass (3.1: for_each only takes
+            // SessionManager's lock to snapshot the list, but a sink
+            // re-entering the Engine — e.g. add/remove_session — must still not
+            // run mid-iteration). MUST#1: inside the pass, each session's
+            // deferred-error drain may invoke EngineConfig::on_error — that is
+            // safe because for_each iterates a lock-free snapshot (no manager
+            // lock is held across the callback) and its contract already
+            // allows create_session/remove_session from inside fn.
             std::error_code cb_error;
             try {
                 sessions_.for_each([&cb_error](Session &s) {
@@ -93,6 +102,12 @@ Result<void> Engine::start() {
             }
             if (cb_error)
                 report_error(cfg_.on_error, cb_error);
+            // MUST#1b: the same place that already defers the tick's backstop
+            // report also drains the engine error queue — no session lock is
+            // held here. Sessions drain it themselves after each send-path
+            // lock scope; this catches anything left behind by a session that
+            // was removed (or parked in quarantine) before its own drain.
+            deferred_errors_->drain();
         }
     });
 
@@ -157,6 +172,10 @@ void Engine::stop() {
     }
     if (cb_error)
         report_error(cfg_.on_error, cb_error);
+    // The logout pass above sent frames (and could therefore have queued
+    // transport failures under send_mutex_ — MUST#1b): surface them before
+    // the sessions go away.
+    deferred_errors_->drain();
 
     // Snapshot under the lock, stop outside it: stop() joins the transport IO
     // threads, and a callback running on one of them may re-enter the Engine
@@ -200,6 +219,12 @@ void Engine::drain_reap_list() {
             // Owned by this thread – stop() only requests shutdown here;
             // destroying the joinable thread object on its own thread would
             // abort, so park it in the quarantine instead.
+            // #6: a quarantined session is NEVER destroyed — but the Engine's
+            // audit log is (Engine dtor). Detach the raw pointer before the
+            // conn leaves the Engine's care so a late frame cannot audit into
+            // a freed IAuditLog (audit_frame null-checks, so auditing simply
+            // stops for a session that is already being torn down).
+            conn.session->set_audit_log(nullptr);
             conn.transport->stop();
             quarantine(std::move(conn));
         } else {
@@ -222,14 +247,27 @@ Session *Engine::add_session(SessionConfig cfg, std::unique_ptr<ITransport> tran
     // Wire session → transport *before* the session is created: the closures
     // only capture the transport, which already exists at this point.
     SessionCallbacks internal_cbs = std::move(user_cbs);
-    internal_cbs.do_send = [t = shared_transport, sink = cfg_.on_error](const std::string &bytes) {
+    internal_cbs.do_send = [t = shared_transport,
+                            errs = deferred_errors_](const std::string &bytes) {
         // 2.6: the transport Result used to be discarded ((void) cast) — a
         // failed write (peer gone, EPIPE, torn-down socket) vanished without a
         // trace. Surface it on the engine error sink; error_code already
         // carries the fix::ErrorCode message.
+        //
+        // MUST#1b: this lambda runs under Session::send_mutex_ (see the
+        // ACCEPTED BOUNDARY in session_manager.hpp), so it must NOT invoke
+        // the user sink inline — push into the engine's deferred queue
+        // (lock order send → engine-error-queue) and let the session drain
+        // it as soon as its own lock scope ends.
         auto sent = t->send(bytes);
         if (!sent)
-            report_error(sink, sent.error());
+            errs->push(sent.error());
+    };
+    // ...and the matching drain: Session calls this from
+    // drain_pending_errors() AFTER every send-path lock scope and from
+    // on_timer(), i.e. with no session lock held.
+    internal_cbs.drain_deferred_errors = [errs = deferred_errors_] {
+        errs->drain();
     };
     // Session::disconnect() (CompID mismatch, heartbeat timeout, …) must
     // actually close the socket, otherwise a hostile peer pins the acceptor's
@@ -244,8 +282,7 @@ Session *Engine::add_session(SessionConfig cfg, std::unique_ptr<ITransport> tran
         // 3.4: open() is the non-throwing path — a corrupt/truncated seq
         // file REFUSES to start the session (StoreError) instead of the
         // legacy ctor's silent reset to 1 (sequence-hijack finding C10).
-        auto fs = FileStore::open(cfg_.store_dir, cfg.id,
-                                  {.fsync_messages = cfg_.fsync_messages});
+        auto fs = FileStore::open(cfg_.store_dir, cfg.id, {.fsync_messages = cfg_.fsync_messages});
         if (!fs) {
             report_error(cfg_.on_error, fs.error());
             return nullptr;
@@ -255,13 +292,35 @@ Session *Engine::add_session(SessionConfig cfg, std::unique_ptr<ITransport> tran
         store = std::make_unique<MemoryStore>();
     }
 
-    auto session =
-        sessions_.create_session(std::move(cfg), std::move(store), dict, std::move(internal_cbs));
-    if (!session)
-        return nullptr; // duplicate SessionID – never silently replace
-    // 3.5: RX/TX audit wiring — without this, production sessions silently
-    // used NullAuditLog (sessions in unit tests were wired directly).
-    session->set_audit_log(audit_log_.get());
+    std::shared_ptr<Session> session;
+    {
+        //3.5: RX/TX audit wiring — without this, production sessions silently
+        // used NullAuditLog (sessions in unit tests were wired directly).
+        //
+        // Registration + capture happen atomically under audit_mtx_, which
+        // set_audit_log() also holds across its rewire-then-swap: a session
+        // can therefore never register under the OLD log while a swap
+        // destroys it — it either is in the swap's for_each snapshot (gets
+        // re-wired) or registers after the swap (captures the new log).
+        // audit_mtx_ is a registry-level lock like conn_mutex_: taken here and
+        // in set_audit_log only, never across a user callback (the failure
+        // report below runs outside it) and always before SessionManager's
+        // lock, never after.
+        std::lock_guard audit_lock(audit_mtx_);
+        session = sessions_.create_session(std::move(cfg), std::move(store), dict,
+                                           std::move(internal_cbs));
+        if (session)
+            session->set_audit_log(audit_log_.get());
+    }
+    if (!session) {
+        // Duplicate SessionID – never silently replace. Report it (#9): both
+        // nullptr causes a caller can hit here (this one and the store-open
+        // failure above, which already reports) are now observable on the
+        // engine sink instead of one of them vanishing into a bare nullptr.
+        // Invoked OUTSIDE audit_mtx_ (user code may re-enter the Engine).
+        report_error(cfg_.on_error, make_error_code(ErrorCode::SessionError));
+        return nullptr;
+    }
 
     // Wire transport → session. Callbacks capture a weak_ptr: a session that is
     // removed while the transport IO thread is still draining cannot be
@@ -379,6 +438,14 @@ bool Engine::remove_session(const SessionID &sid) {
             // which reaps it off this thread (F3). sessions_.remove above
             // already ran, so lookups fail while the reap entry holds the last
             // strong reference.
+            // #6: the entry parked here may end up in the quarantine instead
+            // of being destroyed (drain_reap_list reaps whatever the calling
+            // thread owns) — a session that then outlives the Engine must not
+            // keep pointing at its audit log, so detach it here too; the
+            // quarantine branch in drain_reap_list does the same for entries
+            // parked by stop(). audit_frame null-checks, so auditing simply
+            // stops once the session has been removed from the Engine.
+            conn.session->set_audit_log(nullptr);
             std::lock_guard lock(conn_mutex_);
             reap_list_.push_back(std::move(conn));
         } else {
@@ -410,6 +477,20 @@ void Engine::load_builtin_dictionary(FixVersion v) {
 
 const DataDictionary *Engine::dictionary(FixVersion v) const noexcept {
     return DictionaryRegistry::instance().get(v);
+}
+
+void Engine::set_audit_log(std::unique_ptr<IAuditLog> log) {
+    // #5: sessions captured the PREVIOUS log by raw pointer in add_session(),
+    // so swapping the member alone would leave them auditing into a destroyed
+    // IAuditLog (UAF) — re-wire every live session first, then install the
+    // new sink, both under audit_mtx_ (the same lock add_session() holds
+    // across register+capture, so the two cannot interleave; see the comment
+    // there). for_each() iterates a lock-free snapshot of the registry, so
+    // no SessionManager lock is held across the callback and re-entrancy into
+    // the session (set_audit_log is a plain atomic store) is safe.
+    std::lock_guard audit_lock(audit_mtx_);
+    sessions_.for_each([raw = log.get()](Session &s) { s.set_audit_log(raw); });
+    audit_log_ = std::move(log);
 }
 
 } // namespace fix

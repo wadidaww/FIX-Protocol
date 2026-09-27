@@ -634,8 +634,16 @@ TEST(StressEngine, ConcurrentSendTrafficAndSessionChurn) {
                          << " echoes=" << echoes << " echo_ok=" << echo_ok;
     EXPECT_EQ(recv_at_acc.load(), sum_ok) << "every successfully sent pair-1 message arrives";
     EXPECT_EQ(echoes.load(), echo_ok.load()) << "every accepted echo arrives";
-    EXPECT_LE(recv_at_acc.load(), sum_ok) << "no phantom messages";
+    // NIT#12: the old EXPECT_LE(recv_at_acc, sum_ok) was a duplicate of the
+    // EXPECT_EQ above (it can never fail once that passes); assert a bound
+    // the equality does NOT imply instead: nothing may arrive that was never
+    // even attempted.
+    EXPECT_LE(recv_at_acc.load(), sum_attempts) << "no phantom messages";
+    // Non-vacuity: the accounting equalities below are only meaningful when
+    // the load actually issued traffic (0 == 0 + 0 would pass for free).
+    EXPECT_GT(sum_attempts, 0u) << "pair-1 load never ran";
     EXPECT_EQ(sum_attempts, sum_ok + sum_err) << "every send attempt is counted exactly once";
+    EXPECT_GT(echo_try.load(), 0u) << "echo load never ran";
     EXPECT_EQ(echo_try.load(), echo_ok.load() + echo_err.load());
 
     EXPECT_EQ(control_cycles.load(), static_cast<std::uint64_t>(kControlCycles));
@@ -1191,7 +1199,12 @@ TEST(StressSession, TimerIoAndDisconnectRaceEndCoherent) {
 
     EXPECT_EQ(sess.state(), SessionState::Disconnected);
     EXPECT_GE(disconnect_calls.load(), 1u) << "disconnect() must run do_disconnect";
-    EXPECT_EQ(user.attempts, user.ok + user.err) << "every send attempt is counted once";
+    // NIT#12: the old attempts == ok + err is a loop invariant (trivially
+    // true, and vacuous if the thread never looped); assert bounds that say
+    // something about the system instead.
+    EXPECT_GT(user.ok, 0u) << "the user sender never succeeded before stop";
+    EXPECT_GE(sess.msgs_sent(), user.ok) << "every successful send produced a frame";
+    EXPECT_LE(user.attempts, 100000u) << "attempts must stay within the designed rate cap";
     EXPECT_GE(sess.msgs_received(), 1u) << "handshake Logon must have been processed";
     EXPECT_GT(feeds.load(), 0u);
     {

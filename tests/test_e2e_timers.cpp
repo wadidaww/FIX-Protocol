@@ -284,6 +284,13 @@ public:
 
     bool is_connected() const noexcept override { return started_.load(std::memory_order_acquire); }
 
+    // Test knob: deliver bytes to the session as if the peer had sent them
+    // (the fake has no IO thread of its own).
+    void inject(const std::string &data) {
+        if (on_data_)
+            on_data_(data.data(), data.size());
+    }
+
     // Test knobs
     std::atomic<bool> fail_sends{false};
 
@@ -318,6 +325,46 @@ struct ErrorSink {
         std::lock_guard lock(mtx);
         return errors.empty() ? std::error_code{} : errors.back();
     }
+};
+
+// Shared state behind RecordingAudit: it OUTLIVES the sink object itself, so
+// a test can keep observing "what did the old sink receive" after the Engine
+// has destroyed it in set_audit_log — which is exactly the moment a missing
+// re-wire (NIT#5) would start writing into freed memory.
+struct AuditCounter {
+    std::mutex mtx;
+    std::vector<AuditEntry> entries;
+
+    std::size_t size() {
+        std::lock_guard lock(mtx);
+        return entries.size();
+    }
+    bool has_outbound(std::string_view needle) {
+        std::lock_guard lock(mtx);
+        for (const auto &e : entries)
+            if (e.outbound && e.raw.find(needle) != std::string::npos)
+                return true;
+        return false;
+    }
+    bool has_inbound(std::string_view needle) {
+        std::lock_guard lock(mtx);
+        for (const auto &e : entries)
+            if (!e.outbound && e.raw.find(needle) != std::string::npos)
+                return true;
+        return false;
+    }
+};
+
+struct RecordingAudit final : IAuditLog {
+    explicit RecordingAudit(std::shared_ptr<AuditCounter> c)
+        : counter(std::move(c)) {}
+    void log(AuditEntry entry) override {
+        std::lock_guard lock(counter->mtx);
+        counter->entries.push_back(std::move(entry));
+    }
+    void flush() override {}
+    void rotate() override {}
+    std::shared_ptr<AuditCounter> counter;
 };
 
 } // namespace
@@ -645,7 +692,73 @@ TEST(TimerE2E, TransportSendFailureSurfacesOnEngineErrorSink) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Engine::stop() must return cleanly even when a user on_logout callback
+// 5. Engine::set_audit_log must RE-WIRE live sessions (NIT#5). Swapping only
+//    the member leaves every session pointing at the OLD sink, which the swap
+//    then destroys — the next audited frame is a use-after-free. Covered for
+//    both call orders: before add_session (wiring new sessions) and after the
+//    handshake (rewiring live ones).
+// ---------------------------------------------------------------------------
+TEST(TimerE2E, SetAuditLogRewiresLiveSessions) {
+    Engine engine(make_engine_config());
+
+    // Sink #1 installed BEFORE add_session: new sessions must pick it up.
+    auto counter1 = std::make_shared<AuditCounter>();
+    engine.set_audit_log(std::make_unique<RecordingAudit>(counter1));
+
+    auto fake = std::make_unique<FakeTransport>();
+    FakeTransport *fake_ptr = fake.get();
+
+    std::atomic<bool> logged_on{false};
+    SessionConfig acc_cfg = make_session_cfg("SERVER", "CLIENT", /*initiator=*/false,
+                                             /*heartbeat_sec=*/1);
+    acc_cfg.reset_on_logon = true;
+    SessionCallbacks cbs;
+    cbs.on_logon = [&](const SessionID &) {
+        logged_on.store(true);
+    };
+    Session *acceptor = engine.add_session(acc_cfg, std::move(fake), cbs);
+    ASSERT_NE(acceptor, nullptr);
+    ASSERT_TRUE(engine.start().has_value());
+    ASSERT_TRUE(wait_until(
+        [&] { return logged_on.load() && acceptor->state() == SessionState::Active; }, 3000ms))
+        << "fake transport handshake never completed";
+
+    // The handshake was audited into sink #1...
+    EXPECT_GT(counter1->size(), 0u) << "no pre-swap frame reached the first sink";
+    EXPECT_TRUE(counter1->has_outbound(msg_frame(msg_types::Logon)));
+    const std::size_t first_at_swap = counter1->size();
+
+    // ...then the sink is SWAPPED. This destroys RecordingAudit #1: with a
+    // missing re-wire, `acceptor` would keep pointing at the freed object and
+    // the next frame below would be a use-after-free (ASan gate) / would land
+    // in counter1 (assertion below).
+    auto counter2 = std::make_shared<AuditCounter>();
+    engine.set_audit_log(std::make_unique<RecordingAudit>(counter2));
+    RecordingAudit *second_raw = static_cast<RecordingAudit *>(engine.audit_log());
+    ASSERT_NE(second_raw, nullptr);
+    EXPECT_EQ(second_raw->counter, counter2);
+
+    // Post-swap traffic, both directions: TX via send(), RX via inject().
+    Message hb(msg_types::Heartbeat);
+    ASSERT_TRUE(acceptor->send(hb).has_value());
+    fake_ptr->inject(make_raw_test_request("CLIENT", "SERVER", 2, "PING-AFTER-SWAP"));
+
+    ASSERT_TRUE(wait_until([&] { return counter2->size() >= 2u; }, 3000ms))
+        << "post-swap frames never reached the new sink";
+    EXPECT_TRUE(counter2->has_outbound(msg_frame(msg_types::Heartbeat)));
+    EXPECT_TRUE(counter2->has_inbound("PING-AFTER-SWAP"));
+
+    // Sink #1's state outlives the destroyed sink object: it must NOT have
+    // grown — every post-swap frame went to sink #2 only.
+    EXPECT_EQ(counter1->size(), first_at_swap)
+        << "a session kept auditing into the destroyed old sink (set_audit_log "
+           "swapped the member without re-wiring live sessions)";
+
+    engine.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 6. Engine::stop() must return cleanly even when a user on_logout callback
 //    throws — a throw during the shutdown logout pass must not abort the
 //    joins and wedge the process.
 // ---------------------------------------------------------------------------

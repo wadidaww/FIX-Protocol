@@ -4,6 +4,13 @@
 > Produced by 4 parallel deep-analysis agents (core/parser, session/engine,
 > store/transport/log/dict, tests/CI/build) + direct verification.
 > Companion document: `docs/proposed-plan.md`.
+>
+> **Maintenance note**: this is a point-in-time snapshot. Findings fixed by
+> the later hardening phases are struck through (`~~like this~~`) and
+> followed by a `**FIXED/UPDATED (phase)**` note with the corresponding test
+> where one exists — the struck text is kept as historical record, so do not
+> treat an un-struck row as current merely because it is old: check the note
+> first. (Phase 3 review pass: MUST#1, SHOULD#2–5/13, NIT#6–12.)
 
 ---
 
@@ -53,7 +60,7 @@ apps/oms/main.cpp (180)   — reference OMS demo
 Application (apps/oms, user code)
    │  Session::send(Message) / SessionCallbacks
 Engine (src/engine.cpp)
-   │  owns sessions, transports, timer thread (200 ms tick), audit log (never used)
+   │  owns sessions, transports, timer thread (200 ms tick), audit log (RX/TX frames wired in 3.5; was "never used")
 Session (src/session/session.cpp)  ← FSM + seq numbers + admin msg handling
    │  StreamParser (RX) / MessageBuilder (TX)
    │  IMessageStore (MemoryStore | FileStore)  +  DataDictionary (unused in session!)
@@ -101,6 +108,13 @@ snapshot before you iterate; `Session::send_message` holding `send_mutex_` acros
 ---
 
 ## 4. Critical Findings (P0 — engine unusable / unsafe)
+
+> **Status note**: this section is the ORIGINAL Phase-1 finding set, kept
+> verbatim as history — most items have since been fixed by the Phase 1/2/3
+> hardening commits (wiring, UAF/ownership, parser resync, SOH injection,
+> CompID validation, FileStore atomic persistence + sanitised filenames, audit
+> wiring). Do not read an entry here as "still broken": check the phase
+> commits/tests named in the maintenance note above.
 
 ### C1. Engine never wires `do_send` → zero bytes transmitted via public API
 - `engine.cpp:99-102` contains comment *"We need to update the session's do_send callback … not possible … after creation"* — `Session::send_message` (`session.cpp:440-441`) silently drops every message. README usage example and `apps/oms` are non-functional. No test touches `Engine`, so nothing catches it.
@@ -191,7 +205,7 @@ snapshot before you iterate; `Session::send_message` holding `send_mutex_` acros
 
 - ~~**Deadlock hazard**: `SessionManager::for_each` holds `shared_lock` across `on_timer` → user callbacks + network I/O; callback calling `add_session/remove_session` (unique_lock same mutex) = recursive `shared_mutex` lock → UB/deadlock.~~ **FIXED (3.1)**: `for_each` snapshots the `shared_ptr` list under the lock, releases it, then iterates; `session_manager.cpp` + regression test `LockOrder.ForEachAllowsManagerMutationFromCallback`.
 - Lock ordering (audit 3.1): resend path snapshots the store **before** taking `send_mutex_` (no `store → send` nesting); send path takes `send_mutex_ → store → transport` — all consistent with the documented order `manager → recv → send → store → transport`.
-- `do_send` invoked **while `send_mutex_` held**: kept as the documented *accepted boundary* (3.1) — it is the transport enqueue (bounded, non-blocking, no user code) that establishes `send → transport` ordering; user callbacks (`SessionCallbacks::on_*`, `EngineConfig` hooks) were audited to run with no manager/store/send lock held.
+- ~~`do_send` invoked **while `send_mutex_` held**: kept as the documented *accepted boundary* (3.1) — it is the transport enqueue (bounded, non-blocking, no user code) that establishes `send → transport` ordering; user callbacks (`SessionCallbacks::on_*`, `EngineConfig` hooks) were audited to run with no manager/store/send lock held.~~ **UPDATED (MUST#1)**: the accepted boundary stands (transport *enqueue* under `send_mutex_`), but the second half of the claim was wrong — `EngineConfig::on_error` fired from that wiring ran **under** `send_mutex_`. Now: transport failures push into the engine's `DeferredErrorSink` and `Session::report()` buffers into `pending_err_mtx_`; both are leaf queues drained only after the send lock is released (`Session::drain_pending_errors()` after every send-path scope + `on_timer`, engine timer loop/`stop()`), so no user error sink can ever run while a session lock is held. Tests: `LockOrder.OnErrorNeverRunsUnderSendLock`, `TimerE2E.TransportSendFailureSurfacesOnEngineErrorSink`.
 - User `on_message` throwing inside `on_data` catch skips `incr_target_seq_num` → next message looks like gap → ResendRequest storm. Timer-thread callback exceptions → `std::terminate`.
 
 ### Transport
@@ -246,9 +260,9 @@ snapshot before you iterate; `Session::send_message` holding `send_mutex_` acros
 
 ## 7. Tests — coverage & gaps
 
-**Covered (56 tests):** parser happy-path + 3-byte chunking + concatenation; outbound checksum/body-length; Message get/set; dictionary load/lookup/validate (unit) + `resolve_appl_ver_id`; MemoryStore/FileStore basics (tmpdir per test — parallel collision fixed in history); session basics (logon, heartbeat, seq).
+**Covered (170 ctest entries as of the Phase 3 review pass):** parser happy-path + 3-byte chunking + concatenation; outbound checksum/body-length; Message get/set; dictionary load/lookup/validate (unit) + `resolve_appl_ver_id`; MemoryStore/FileStore basics (tmpdir per test — parallel collision fixed in history); session basics (logon, heartbeat, seq); plus Phases 2–3: real-socket handshake, resend/gap recovery, SequenceReset, timers/timeouts, disconnect+reconnect, churn under traffic, FileStore crash recovery (kill -9, torn-write repair, torn-seq snapshot race), legacy-store migration, lock-order/deferred-error regressions, transport, audit log.
 
-**Zero coverage for:** end-to-end handshake over real socket (**would have caught C1**), resend/gap recovery, SequenceReset both modes, duplicate logon, timer/timeouts (TestRequest/Logout), disconnect+reconnect, `remove_session` under traffic, CompID/BeginString rejection, malformed/garbage/resync/oversized input, duplicate tags/groups, SOH injection, FileStore crash recovery, concurrency (TSAN job vacuous), Engine lifecycle, transport, message_log. TUs `engine.cpp`, `session_manager.cpp`, `tcp_transport.cpp`, `message_log.cpp` (658 lines) have **0% coverage**.
+~~**Zero coverage for:** end-to-end handshake over real socket (**would have caught C1**), resend/gap recovery, SequenceReset both modes, duplicate logon, timer/timeouts (TestRequest/Logout), disconnect+reconnect, `remove_session` under traffic, CompID/BeginString rejection, malformed/garbage/resync/oversized input, duplicate tags/groups, SOH injection, FileStore crash recovery, concurrency (TSAN job vacuous), Engine lifecycle, transport, message_log. TUs `engine.cpp`, `session_manager.cpp`, `tcp_transport.cpp`, `message_log.cpp` (658 lines) have **0% coverage**.~~ **UPDATED (Phases 1–3, 168 tests)**: the bulk of this list is now covered — real-socket handshake, resend/gap recovery, SequenceReset, duplicate logon, timers/TestRequest/Logout, disconnect+reconnect, `remove_session` under traffic, CompID/BeginString rejection, malformed/garbage/resync/oversized input, FileStore crash recovery (kill -9, torn-write repair, torn-seq snapshot race), Engine lifecycle, transport, audit log, and lock-order/concurrency regressions (TSAN job no longer vacuous: it runs the full suite twice under `second_deadlock_stack=1`). Still genuinely thin: `apps/oms` coverage, dictionary feature matrix, Windows transport, TLS.
 
 ---
 
@@ -282,9 +296,9 @@ snapshot before you iterate; `Session::send_message` holding `send_mutex_` acros
 | "ApplVerID routing" | ⚠️ function exists + tested, zero callers |
 | CI "every push" / "GCC 13 + Clang 18" | ❌ stale/false (triggers narrow; uses GCC-14/Clang-19) |
 | Hot-reloadable atomic dictionary swap | ❌ no-op stub |
-| FileStore crash-safe | ❌ truncate-write, no fsync |
-| Audit rotation **and retention** | ❌ rotation broken; retention absent |
-| MiFID II / SEC 605/606 compliance | ❌ audit log never written |
+| ~~FileStore crash-safe~~ | ~~❌ truncate-write, no fsync~~ ✅ **FIXED (3.4)**: tmp+fsync+atomic-rename+parent-dir fsync; strict seq-file validation (refuse, never rebase); torn log tail dropped **and** truncated (`rebuild_index`); verified by kill -9 + 1000-snapshot race tests |
+| ~~Audit rotation **and retention**~~ | ~~❌ rotation broken; retention absent~~ ✅ **FIXED (3.5)**: rotation stamps at rotation time, de-dups same-second files, `retain_days` enforced |
+| ~~MiFID II / SEC 605/606 compliance~~ | ~~❌ audit log never written~~ ✅ **audit log written (3.5)** — every RX/TX frame; compliance regimes themselves remain out of scope/unverified |
 | TLS 1.3 ready | ❌ flag only, no OpenSSL code |
 | Zero-copy parser, no intermediate allocs | ❌ copies everywhere |
 | "production-ready, ultra-reliable" | ❌ unsupported (no e2e test, C1–C13) |

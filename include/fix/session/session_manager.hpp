@@ -11,11 +11,14 @@
 //
 //     manager  →  recv  →  send  →  store  →  transport
 //
-//   manager   SessionManager::mutex_ (this class) and Engine::conn_mutex_
-//             (transport/session registry). The two registry locks are peers:
-//             they are never nested with each other either (Engine snapshots
-//             under conn_mutex_ and calls into the manager only after
-//             releasing it, and vice versa).
+//   manager   SessionManager::mutex_ (this class), Engine::conn_mutex_ AND
+//             Engine::audit_mtx_ (transport/session registry + audit-sink
+//             swap). The registry locks are peers: they are never nested
+//             with each other either (Engine snapshots under conn_mutex_ and
+//             calls into the manager only after releasing it, and vice
+//             versa); audit_mtx_ sits above the manager lock (it is taken
+//             across create_session's register+capture pair and across
+//             set_audit_log's for_each snapshot).
 //   recv      Session::parser_mtx_ / Session::test_req_mtx_ — leaf locks: no
 //             other mutex is ever acquired while they are held, and the
 //             message dispatch (process_message → user callbacks) runs after
@@ -25,6 +28,14 @@
 //   store     IMessageStore internal mutex (MemoryStore/FileStore).
 //   transport TcpTransport::send_mutex_ (send queue + conn_fd_) — leaf.
 //
+//   Two LEAF error buffers may be taken from UNDER `send` and nothing later:
+//     errbuf   Session::pending_err_mtx_ and the Engine's DeferredErrorSink
+//              queue (see DeferredErrorSink in engine.hpp). Push/swap only —
+//              NO callback ever runs while either is held. Errors collected
+//              there are drained only after every session lock is released:
+//              Session::drain_pending_errors() (owning thread, after each
+//              send-path lock scope) and the engine's timer loop / stop().
+//
 // Rules (audited in 3.1; violations are bugs, not style):
 //   * NEVER hold manager, store or send across a USER callback
 //     (SessionCallbacks::on_*, EngineConfig hooks). Snapshot before you
@@ -32,6 +43,14 @@
 //     the lock, then invokes the callback; Engine::start/stop and the timer
 //     pass do the same for their connection/session sweeps, and error-sink
 //     reports are deferred until after the pass.
+//     MUST#1 closed the last hole in this rule: a report() reached while
+//     send_mutex_ is held (same thread — send_owner_ records the holder) no
+//     longer invokes on_error; it buffers into pending_err_mtx_ and the
+//     error is delivered by drain_pending_errors() once the lock scope ends,
+//     and the Engine's do_send wiring pushes transport failures into the
+//     engine error queue for exactly the same deferred drain. User error
+//     sinks therefore cannot re-enter a locked Session (lock-order
+//     violation → deadlock) and cannot touch transport state mid-send.
 //   * ACCEPTED BOUNDARY: Session::send_message holds send_mutex_ across
 //     cbs_.do_send → ITransport::send. That call is the transport ENQUEUE
 //     (bounded, non-blocking, syscall under the transport leaf lock, no user

@@ -32,6 +32,28 @@
 
 namespace fix {
 
+namespace {
+
+// Runs `fn` when the enclosing scope exits. Send paths construct this BEFORE
+// their SendLock so it runs AFTER the lock guard is destroyed (guards
+// destruct in reverse construction order) — that is where report() errors
+// buffered under send_mutex_ are drained (MUST#1: no user callback may run
+// under the send lock). `fn` must not throw; drain_pending_errors() is
+// noexcept.
+template <typename F>
+struct ScopeExit {
+    explicit ScopeExit(F f)
+        : fn(std::move(f)) {}
+    ~ScopeExit() { fn(); }
+    ScopeExit(const ScopeExit &) = delete;
+    ScopeExit &operator=(const ScopeExit &) = delete;
+    F fn;
+};
+template <typename F>
+ScopeExit(F) -> ScopeExit<F>;
+
+} // namespace
+
 std::string_view to_string(SessionState s) noexcept {
     switch (s) {
     case SessionState::NotConnected:
@@ -81,9 +103,12 @@ Session::~Session() {
 }
 
 void Session::audit_frame(bool outbound, std::string_view raw) noexcept {
-    // 3.5: single funnel for the audit trail. Never throws into the
-    // RX/TX path — an audit backend failure surfaces through report()
-    // (on_error + error counter) instead of aborting message processing.
+    // 3.5: single funnel for the audit trail. Never throws into the RX/TX
+    // path — an audit backend failure surfaces through report() (error
+    // counter + on_error) instead of aborting message processing. On the TX
+    // side this runs under send_mutex_, so report() only BUFFERS the message
+    // here; the user sink runs from drain_pending_errors() after the lock
+    // scope (MUST#1). audit_frame itself never invokes user code.
     IAuditLog *log = audit_.load(std::memory_order_acquire);
     if (!log)
         return;
@@ -222,7 +247,8 @@ Result<void> Session::send(Message msg) {
 Result<void> Session::send_raw(const std::string &raw) {
     // Raw escape hatch: bytes are already framed, no seq management. Kept
     // ungated (engine tests use it to inject an exact TestRequest frame).
-    std::lock_guard lock(send_mutex_);
+    ScopeExit drain([this] { drain_pending_errors(); }); // runs AFTER SendLock
+    SendLock lock(*this);
     if (cbs_.do_send)
         cbs_.do_send(raw);
     audit_frame(true, raw); // TX (3.5): raw frames hit the wire too
@@ -255,6 +281,13 @@ void Session::on_timer() {
     // ErrorCode::SessionError on EngineConfig::on_error). Catching here would
     // hide failures from that boundary. Unit tests drive on_timer() directly
     // with non-throwing callbacks.
+    //
+    // MUST#1 backstop: a buffered error can outlive its own send-path drain
+    // when the re-entrancy gate was held by another drain at that moment
+    // (see drain_pending_errors). The 200 ms timer tick picks those up — and
+    // it is also where the engine's deferred transport-error queue gets a
+    // regular drain through SessionCallbacks::drain_deferred_errors.
+    ScopeExit drain([this] { drain_pending_errors(); });
     const auto st = state_.load(std::memory_order_acquire);
     const auto n = clock_now();
     // Timer-side reads go through the atomic mirror — cfg_.heartbeat_interval
@@ -793,7 +826,12 @@ void Session::handle_resend_request(const Message &msg) {
 
     // 2.2: the whole replay runs under send_mutex_ so a concurrent send()
     // cannot interleave frames into the middle of the gap-fill sequence.
-    std::lock_guard lock(send_mutex_);
+    // MUST#1: the drain guard is constructed FIRST so it runs after SendLock
+    // releases — report() calls made inside the replay (flush_gap's
+    // serialisation failure, TX audit failures) are buffered, never invoked,
+    // under the lock.
+    ScopeExit drain([this] { drain_pending_errors(); });
+    SendLock lock(*this);
 
     const std::string version(fix::to_string(cfg_.id.version));
     SeqNum cursor = begin; // first sequence still unaccounted for
@@ -1058,7 +1096,10 @@ Result<void> Session::send_logon() {
     // concurrent send()/logon() (#4): send_message() takes this same mutex,
     // so the locked variant is used below. Lock order is always
     // send_mutex_ -> store lock (same as every other send path).
-    std::lock_guard lock(send_mutex_);
+    // MUST#1: drain guard first ⇒ it runs after the lock releases, on every
+    // early return below (report() under the lock only buffers).
+    ScopeExit drain([this] { drain_pending_errors(); });
+    SendLock lock(*this);
 
     const SessionState desired =
         cfg_.initiator ? SessionState::LogonSent : SessionState::WaitingLogon;
@@ -1225,7 +1266,12 @@ void Session::send_business_reject(SeqNum ref_seq, int business_reject_reason,
 }
 
 Result<void> Session::send_message(Message &msg) {
-    std::lock_guard lock(send_mutex_);
+    // MUST#1: drain after the lock scope (guard order: drain is destroyed
+    // last), so any report() made while send_mutex_ was held — store
+    // rollback failure, TX audit failure, do_send-side reports — reaches
+    // on_error with no lock held.
+    ScopeExit drain([this] { drain_pending_errors(); });
+    SendLock lock(*this);
     return send_message_locked(msg);
 }
 
@@ -1318,14 +1364,77 @@ bool Session::transition(SessionState expected, SessionState desired) {
                                           std::memory_order_acquire);
 }
 
-void Session::report(std::string_view what) noexcept {
-    ++errors_;
+void Session::invoke_on_error(std::string_view what) noexcept {
     if (!cbs_.on_error)
         return; // no logging infra in this process — documented floor
     try {
         cbs_.on_error(cfg_.id, what);
     } catch (...) {
         // The error sink itself must never take an IO/timer thread down.
+    }
+}
+
+void Session::report(std::string_view what) noexcept {
+    // The counter is bumped SYNCHRONOUSLY, always — the deferral below only
+    // affects when the user callback sees the message (MUST#1).
+    ++errors_;
+    if (!cbs_.on_error)
+        return; // no logging infra in this process — documented floor
+    if (send_owner_.load(std::memory_order_acquire) == std::this_thread::get_id()) {
+        // Called while THIS thread holds send_mutex_ (store rollback, TX
+        // audit failure, gap-fill serialisation, …). Invoking on_error here
+        // would run user code under the lock — and a handler that calls
+        // Session::send() would self-deadlock on the non-recursive mutex.
+        // Buffer it: drain_pending_errors() delivers it after the lock scope.
+        std::lock_guard lock(pending_err_mtx_);
+        if (pending_errors_.size() < kMaxPendingErrors)
+            pending_errors_.emplace_back(what);
+        return; // beyond the cap the counter above still records the failure
+    }
+    invoke_on_error(what);
+}
+
+void Session::drain_pending_errors() noexcept {
+    // Re-entrancy / concurrency gate: on_error → Session::send() → this
+    // function again on the SAME thread must return immediately (the loop
+    // below keeps spinning until the buffer is empty, so nothing is lost),
+    // and two threads draining at once would otherwise duplicate callbacks.
+    bool expected = false;
+    if (!draining_errors_.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                  std::memory_order_acquire))
+        return;
+    struct ClearGate {
+        std::atomic<bool> &gate;
+        ~ClearGate() { gate.store(false, std::memory_order_release); }
+    } gate{draining_errors_};
+
+    // Rounds are bounded: a handler that re-arms its own failure on every
+    // invocation must degrade into "buffered, retried on the next drain"
+    // (the buffer is capped too) rather than spin here forever.
+    for (std::size_t round = 0; round < kMaxPendingErrors; ++round) {
+        std::vector<std::string> batch;
+        {
+            std::lock_guard lock(pending_err_mtx_);
+            batch.swap(pending_errors_);
+        }
+        if (!batch.empty()) {
+            for (const auto &what : batch)
+                invoke_on_error(what);
+            continue;
+        }
+        // Session errors are empty: now (and only now) run the engine-side
+        // drain — no session lock is held here, so EngineConfig::on_error is
+        // safe to invoke (MUST#1b).
+        if (cbs_.drain_deferred_errors) {
+            try {
+                cbs_.drain_deferred_errors();
+            } catch (...) {
+                // The engine sink is user code too; it must not kill the drain.
+            }
+        }
+        std::lock_guard lock(pending_err_mtx_);
+        if (pending_errors_.empty())
+            break; // the hook (or a handler above) queued nothing new
     }
 }
 

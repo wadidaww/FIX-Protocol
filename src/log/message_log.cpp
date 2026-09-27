@@ -206,6 +206,20 @@ void FileAuditLog::write_entry(const AuditEntry &e) {
     line += '\n';
 
     out_ << line;
+    if (!out_) {
+        // NIT#7: an ENOSPC/EIO append used to be INVISIBLE: the stream
+        // latched into the failed state, so every later entry was swallowed
+        // with no trace. Count the loss (write_errors_ — distinct from
+        // dropped_, which is queue overflow / no-open losses), clear the
+        // latch so the next entry really attempts a write again (a rotate
+        // or reopen recovers fully), and do not bill the failed bytes into
+        // current_size_ (an unknown prefix may have landed on disk, so the
+        // exact figure cannot be recovered — undercounting only delays the
+        // size-triggered rotation by those bytes).
+        write_errors_.fetch_add(1, std::memory_order_relaxed);
+        out_.clear();
+        return;
+    }
     current_size_ += line.size();
 
     if (current_size_ >= cfg_.max_size)

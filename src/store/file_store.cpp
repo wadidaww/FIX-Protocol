@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -103,26 +104,56 @@ Result<void> fsync_path(const std::filesystem::path &p) {
 // Filenames
 // ---------------------------------------------------------------------------
 std::string FileStore::sanitize_component(std::string_view raw, std::size_t cap) {
+    // SHOULD#2: INJECTIVE encoding (the old '_'-substitution collided —
+    // "A/B" and "A_B" produced the same filename and could therefore alias
+    // two different sessions onto one store). Every byte outside
+    // [A-Za-z0-9_-] is %XX-hex-escaped (uppercase), so the output can never
+    // contain '/', '\\', '.', ':' or a raw '~' — no path traversal, and the
+    // '~' used by make_prefix() stays unambiguous.
+    if (raw.empty())
+        return "%0"; // encoder-unreachable: a real "%XX" escape needs two hex digits
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    const std::size_t n = raw.size() < cap ? raw.size() : cap;
     std::string out;
-    out.reserve(raw.size() < cap ? raw.size() : cap);
-    for (char c : raw) {
-        if (out.size() >= cap)
-            break;
-        const auto u = static_cast<unsigned char>(c);
-        if (std::isalnum(u) || c == '_' || c == '-')
+    out.reserve(n * 3 + 10);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto u = static_cast<unsigned char>(raw[i]);
+        const bool safe = (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') ||
+                          (u >= '0' && u <= '9') || raw[i] == '_' || raw[i] == '-';
+        if (safe) {
             out.push_back(static_cast<char>(u));
-        else
-            out.push_back('_'); // '/', ':', '.', spaces, control bytes, ...
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[u >> 4]);
+            out.push_back(kHex[u & 0x0F]);
+        }
     }
-    if (out.empty())
-        out.push_back('_'); // keep the component visible & non-empty
+    if (raw.size() > cap) {
+        // Overflow: the first `cap` RAW bytes are encoded verbatim, then a
+        // '~' + 8-hex (low 32 bits of FNV-1a-64) fingerprint of the FULL
+        // component. '~' cannot occur inside an encoded short component (it
+        // would be escaped to %7E), so the marker cannot be confused with a
+        // shorter component, and two long components sharing a 32-byte prefix
+        // differ in the fingerprint — the encoding stays injective.
+        std::uint64_t h = 0xcbf29ce484222325ULL; // FNV-1a 64
+        for (const char c : raw) {
+            h ^= static_cast<unsigned char>(c);
+            h *= 0x100000001b3ULL;
+        }
+        out.push_back('~');
+        for (int shift = 28; shift >= 0; shift -= 4)
+            out.push_back(kHex[(h >> shift) & 0xF]);
+    }
     return out;
 }
 
 std::string FileStore::make_prefix(const SessionID &sid) {
-    // '~' is the field separator BECAUSE sanitisation never lets it survive
-    // inside a component: "A~B" as a single CompID cannot impersonate the
-    // pair (A, B), so distinct SessionIDs always yield distinct filenames.
+    // '~' is the field separator BECAUSE sanitisation never lets a raw '~'
+    // survive inside a component: "A~B" as a single CompID is encoded
+    // "A%7EB" and cannot impersonate the pair (A, B). (A component longer
+    // than the cap carries its own trailing '~<fingerprint>'; see
+    // sanitize_component — it is exactly 8 hex digits after the marker, so it
+    // cannot consume the following separator ambiguity-free either.)
     std::string prefix = sanitize_component(sid.senderCompID);
     prefix += '~';
     prefix += sanitize_component(sid.targetCompID);
@@ -132,6 +163,68 @@ std::string FileStore::make_prefix(const SessionID &sid) {
     }
     return prefix;
 }
+
+// ---------------------------------------------------------------------------
+// Legacy store files (SHOULD#4)
+// ---------------------------------------------------------------------------
+namespace {
+
+// Pre-sanitisation naming (git ff2e056: src/store/file_store.cpp): raw
+// "<sender>-<target>" with NO sanitisation and NO qualifier component.
+std::string legacy_prefix(const SessionID &sid) {
+    std::string s = sid.senderCompID;
+    s += '-';
+    s += sid.targetCompID;
+    return s;
+}
+
+// Move any store files written under the legacy name onto the new name.
+//
+// Never a silent restart: if a legacy sequence file exists while the new one
+// does not, the history MUST come across (starting at 1 with the old frames
+// still on disk is the sequence-hijack vector load_seqs() refuses). Returns
+// StoreError if a required move fails — the caller refuses to open rather
+// than losing the sequence state.
+//
+// Crash-safe ordering: the .out.log/.in.log move FIRST and the .seqnums
+// moves LAST. A crash in between leaves the legacy seq file in place, so the
+// next open re-runs the migration; logs already moved are skipped by the
+// "destination exists" guard, then the seq file is carried over. (The
+// reverse order could load new seq numbers while the logs still sit under
+// the old names — resend history would silently vanish.)
+Result<void> migrate_legacy_files(const std::filesystem::path &dir,
+                                  const std::filesystem::path &seq_out, const std::string &prefix,
+                                  const SessionID &sid) {
+    std::error_code ec;
+    if (std::filesystem::exists(seq_out, ec) || ec)
+        return {}; // already on the new name (or dir unreadable → fail later)
+    const std::string legacy = legacy_prefix(sid);
+    const auto lseq = dir / (legacy + ".seqnums");
+    if (!std::filesystem::exists(lseq, ec) || ec)
+        return {}; // no legacy files for this session
+
+    for (const char *ext : {".out.log", ".in.log"}) {
+        const auto dst = dir / (prefix + ext);
+        std::error_code e2;
+        if (std::filesystem::exists(dst, e2) || e2)
+            continue; // already migrated
+        const auto src = dir / (legacy + ext);
+        if (!std::filesystem::exists(src, e2) || e2)
+            continue;
+        std::error_code ren;
+        std::filesystem::rename(src, dst, ren);
+        if (ren)
+            return make_unexpected(ErrorCode::StoreError);
+    }
+
+    std::error_code ren;
+    std::filesystem::rename(lseq, seq_out, ren);
+    if (ren)
+        return make_unexpected(ErrorCode::StoreError);
+    return {};
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Construction / open
@@ -153,6 +246,15 @@ FileStore::FileStore(std::filesystem::path dir, const SessionID &sid, Options op
     outfile_ = dir_ / (prefix + ".out.log");
     infile_ = dir_ / (prefix + ".in.log");
 
+    // SHOULD#4: carry pre-sanitisation "<sender>-<target>" files over to the
+    // new name BEFORE anything is read, so an upgraded process picks up the
+    // real sequence numbers instead of starting at 1 (a failure here refuses
+    // to open rather than silently rebasing).
+    if (auto r = migrate_legacy_files(dir_, seqfile_, prefix, sid); !r)
+        throw std::system_error(
+            r.error(), "FileStore: refusing to start — cannot migrate legacy store files in '" +
+                           dir_.string() + "'");
+
     // Refuse to start on a corrupt/truncated/unparsable seq file — NEVER a
     // silent reset to 1 (that is the sequence-hijack finding, C10).
     if (auto r = load_seqs(); !r)
@@ -160,7 +262,10 @@ FileStore::FileStore(std::filesystem::path dir, const SessionID &sid, Options op
                                 "FileStore: refusing to start — invalid sequence file '" +
                                     seqfile_.string() + "'");
 
-    rebuild_index();
+    if (auto r = rebuild_index(); !r)
+        throw std::system_error(r.error(),
+                                "FileStore: refusing to start — cannot repair outbound log '" +
+                                    outfile_.string() + "'");
 
     out_stream_.open(outfile_, std::ios::binary | std::ios::app);
     in_stream_.open(infile_, std::ios::binary | std::ios::app);
@@ -322,24 +427,56 @@ Result<void> FileStore::persist_seqs() {
     return {};
 }
 
-void FileStore::rebuild_index() {
+Result<void> FileStore::rebuild_index() {
     std::ifstream f(outfile_, std::ios::binary);
     if (!f.is_open())
-        return;
+        return {}; // no outbound log yet — fresh store
 
     out_index_.clear();
-    std::streampos pos = 0;
+    std::streampos pos = 0;       // start of the record being examined
+    std::streampos last_good = 0; // end of the last COMPLETE record
+    bool torn = false;
     std::string line;
     while (std::getline(f, line)) {
+        // NIT#10 / torn write: a record cut short by a crash or power loss
+        // has no terminating '\n' — getline still delivers it, but only with
+        // eofbit set. NEVER index it: a partial FIX frame must not be
+        // replayed on a gap-fill. Stop before it instead.
+        if (f.eof()) {
+            torn = true;
+            break;
+        }
         // Format: "<seq>|<raw>\n" – we stored it this way in store_outbound
         auto sep = line.find('|');
-        if (sep == std::string::npos)
-            continue;
-        SeqNum seq = 0;
-        std::from_chars(line.data(), line.data() + sep, seq);
-        out_index_[seq] = pos;
+        if (sep != std::string::npos) {
+            SeqNum seq = 0;
+            const char *b = line.data();
+            const char *e = b + sep;
+            const auto pr = std::from_chars(b, e, seq);
+            if (pr.ec == std::errc{} && pr.ptr == e && seq > 0)
+                out_index_[seq] = pos;
+            // Malformed/garbage lines are skipped, never indexed (the old
+            // code indexed them under seq 0 and, worse, did not advance
+            // `pos`, shifting every later offset onto the wrong record).
+        }
         pos = f.tellg();
+        last_good = pos;
     }
+
+    if (!torn)
+        return {};
+
+    // Truncate the torn tail away: leaving it would make the NEXT append
+    // concatenate onto the partial frame, corrupting both records. refresh()
+    // can reach here with out_stream_ open — it appends at EOF, so it simply
+    // resumes on the new (record-aligned) boundary.
+    f.close();
+    std::error_code ec;
+    std::filesystem::resize_file(
+        outfile_, static_cast<std::uintmax_t>(static_cast<std::streamoff>(last_good)), ec);
+    if (ec)
+        return make_unexpected(ErrorCode::StoreError);
+    return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +674,11 @@ Result<void> FileStore::refresh() {
     // were running yields an error, not a silent rebase (3.4).
     if (auto r = load_seqs(); !r)
         return r;
-    rebuild_index();
+    // Re-index AND repair a torn tail (NIT#10) before the reopen below, so a
+    // partial frame left by a failed/crashed append can never be concatenated
+    // onto by the next write.
+    if (auto r = rebuild_index(); !r)
+        return r;
     // Recover from a latched write error: reopen a stream that is in a
     // failed state so a transient ENOSPC does not permanently wedge sends.
     if (out_stream_.is_open() && !out_stream_) {

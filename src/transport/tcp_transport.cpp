@@ -516,9 +516,13 @@ void TcpTransport::run_acceptor() {
                 break;
             }
             if (prepare_socket(fd) != 0) {
+                // NIT#11: capture errno BEFORE close() — close() can itself
+                // fail (EINTR/EBADF/...) and clobber errno, which would hand
+                // the error sink a misleading code.
+                const int err = errno;
                 ::close(fd);
                 if (on_error_)
-                    on_error_(std::error_code(errno, std::system_category()));
+                    on_error_(std::error_code(err, std::system_category()));
                 continue;
             }
 
@@ -914,8 +918,8 @@ int TcpTransport::apply_keepalive(int fd) {
     const int one = 1;
     if (::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0)
         return -1;
-        // Knob names differ per platform; all guarded so a missing one degrades to
-        // the kernel default rather than failing the connection.
+        // Knob names differ per platform; all guarded so a missing one degrades
+        // to the kernel default rather than failing the connection.
 #ifdef TCP_KEEPIDLE
     (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &kKeepIdleSec, sizeof(kKeepIdleSec));
 #elif defined(TCP_KEEPALIVE) // macOS/BSD spell the *idle* time differently
@@ -953,7 +957,12 @@ int TcpTransport::prepare_socket(int fd) {
     int one = 1;
     (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-    (void)apply_keepalive(fd); // 3.3 backstop liveness probe
+    // 3.3 backstop liveness probe. The return value is DELIBERATELY ignored
+    // (NIT#11): keepalive is a best-effort knob — SO_KEEPALIVE failing must
+    // never abort an otherwise healthy connection, and apply_keepalive()
+    // already stops at the first hard failure and leaves the kernel default
+    // in place. Per-knob failures above are swallowed the same way.
+    (void)apply_keepalive(fd);
 #endif
     return 0;
 }

@@ -96,7 +96,24 @@ struct SessionCallbacks {
     // callback threw, ...). Optional: when unset the engine has no logging
     // infrastructure, so the error is dropped — this callback is the
     // documented floor for surfacing it. (2.6)
-    std::function<void(const SessionID &, std::string_view what)> on_error;
+    //
+    // Phase 3 (MUST#1): RE-ENTRANCY IS PERMITTED. The sink is never invoked
+    // while Session::send_mutex_ is held — a report() made under the lock is
+    // buffered and delivered by Session::drain_pending_errors() after the
+    // lock scope ends (and from on_timer()), so calling Session::send()/
+    // send_raw()/logon() from inside on_error is safe and cannot self-
+    // deadlock (std::mutex is non-recursive). It may still be invoked
+    // concurrently from several threads; keep it thread-safe, and never
+    // throw out of it (throws are swallowed).
+    std::function<void(const SessionID &, std::string_view)> on_error;
+
+    // ENGINE WIRING, not a user hook (MUST#1): invoked by
+    // Session::drain_pending_errors() after every send-path lock scope and
+    // from on_timer(), with NO session lock held. The Engine points it at
+    // its deferred transport-send-error queue, so EngineConfig::on_error
+    // never runs under send_mutex_ even though the do_send wiring that
+    // produces those errors does. Optional: no-op when unset.
+    std::function<void()> drain_deferred_errors;
 
     // Transport send callback (engine calls this to write bytes to the wire)
     std::function<void(const std::string &)> do_send;
@@ -211,11 +228,62 @@ private:
     // prior null check; atomic so wiring races are impossible under TSAN.
     std::atomic<IAuditLog *> audit_{nullptr};
     // Emits one audit entry; never throws into the session path (an audit
-    // backend failure is routed to on_error via report(), it cannot break
-    // message processing).
+    // backend failure is routed to report(), which buffers it when the TX
+    // side runs under send_mutex_ — audit_frame itself never calls user
+    // code). It cannot break message processing.
     void audit_frame(bool outbound, std::string_view raw) noexcept;
 
+    // -- send_mutex_ + owner tracking (Phase 3, MUST#1) ----------------------
+    // Send paths lock through SendLock (never a bare lock_guard) so that
+    // report() can tell whether the CALLING THREAD already holds the lock:
+    // no user callback may ever run under send_mutex_ (3.1 exit criterion),
+    // so a report() made while the lock is held is buffered into
+    // pending_errors_ and delivered by drain_pending_errors() after the lock
+    // scope ends. Ownership is per-session: a thread holding session A's lock
+    // still gets a synchronous on_error for session B.
     mutable std::mutex send_mutex_;
+    std::atomic<std::thread::id> send_owner_{std::thread::id{}};
+
+    struct SendLock {
+        explicit SendLock(Session &s) noexcept
+            : s_(s) {
+            s_.send_mutex_.lock();
+            s_.send_owner_.store(std::this_thread::get_id(), std::memory_order_release);
+        }
+        ~SendLock() noexcept {
+            s_.send_owner_.store(std::thread::id{}, std::memory_order_release);
+            s_.send_mutex_.unlock();
+        }
+        SendLock(const SendLock &) = delete;
+        SendLock &operator=(const SendLock &) = delete;
+
+    private:
+        Session &s_;
+    };
+
+    // -- Deferred error buffer (Phase 3, MUST#1) ----------------------------
+    // report() called WHILE send_mutex_ is held enqueues here instead of
+    // invoking SessionCallbacks::on_error (which would run user code under
+    // the lock — and re-enter send() → self-deadlock). Guarded by its own
+    // tiny leaf mutex, never held across a callback: the lock order is
+    // send → pending_err_mtx_, and drain_pending_errors() swaps the batch
+    // out before invoking anything (see session_manager.hpp).
+    mutable std::mutex pending_err_mtx_;
+    std::vector<std::string> pending_errors_;
+    // Bounded: a drain that never runs (unit tests that never tick the
+    // session) must not grow the buffer without limit. The error COUNT is
+    // never affected — errors_ is incremented synchronously in report().
+    static constexpr std::size_t kMaxPendingErrors = 64;
+    // Re-entrancy gate: on_error → Session::send() → send_message → drain
+    // again on the same thread. The outer drain keeps looping until the
+    // buffer is empty, so a nested call returns immediately.
+    std::atomic<bool> draining_errors_{false};
+    // Delivers buffered errors. Called AFTER every send-path lock scope
+    // (send_message, send_raw, send_logon, handle_resend_request incl. the
+    // resend replay loop) and from on_timer() — never while send_mutex_ is
+    // held. Also drains the engine's deferred transport-error queue through
+    // SessionCallbacks::drain_deferred_errors.
+    void drain_pending_errors() noexcept;
 
     // -- Shared timing state (F2 / 2.3) -------------------------------------
     // Epoch milliseconds, stored atomically: written on IO/user threads
@@ -398,7 +466,13 @@ private:
     }
     // Routes to SessionCallbacks::on_error; swallows when unset (no logging
     // infra exists — that is the documented floor, see SessionCallbacks).
+    // The error COUNTER is always bumped here, immediately. Delivery is
+    // synchronous UNLESS the calling thread already holds send_mutex_ —
+    // then the message is buffered for drain_pending_errors() so user code
+    // never runs under the send lock (MUST#1, see SessionCallbacks).
     void report(std::string_view what) noexcept;
+    // Single guarded invocation of SessionCallbacks::on_error (never throws).
+    void invoke_on_error(std::string_view what) noexcept;
 
     // -- Session-end notification -------------------------------------------
     // Single gate for on_logout: fires the callback at most once per

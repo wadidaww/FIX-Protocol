@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,6 +23,71 @@
 #include "transport/transport.hpp"
 
 namespace fix {
+
+// ---------------------------------------------------------------------------
+// Deferred engine error sink (Phase 3, MUST#1b)
+//
+// EngineConfig::on_error is USER code and must never run while
+// Session::send_mutex_ is held — yet the Engine's do_send wiring runs
+// exactly there. A transport send failure is therefore PUSHed into this
+// queue and drained from places that hold no session lock:
+//   * Session::drain_pending_errors() after every send-path lock scope (via
+//     SessionCallbacks::drain_deferred_errors, wired in Engine::add_session)
+//     — synchronous from the sender's point of view, and
+//   * the engine's timer loop, next to the existing deferred backstop report
+//     (the ~200 ms backstop for everything else).
+// Lock order: send → engine-error-queue (leaf; see the statement at the top
+// of session_manager.hpp). Shared by pointer because the queue itself must
+// outlive the Engine: a session parked in stop()'s never-destroyed
+// quarantine can still drain after the Engine is gone.
+// ---------------------------------------------------------------------------
+class DeferredErrorSink {
+public:
+    explicit DeferredErrorSink(std::function<void(std::error_code)> sink)
+        : sink_(std::move(sink)) {}
+
+    // Producer side — MAY be called with Session::send_mutex_ held (that is
+    // the whole point): it only takes the queue's own leaf mutex.
+    void push(std::error_code ec) {
+        std::lock_guard lock(mtx_);
+        if (queue_.size() >= kMaxQueued) {
+            ++dropped_; // bounded like Session::pending_errors_ — count, don't grow
+            return;
+        }
+        queue_.push_back(ec);
+    }
+
+    // Consumer side — NEVER call with a session lock held.
+    void drain() noexcept {
+        std::vector<std::error_code> batch;
+        {
+            std::lock_guard lock(mtx_);
+            batch.swap(queue_);
+        }
+        if (!sink_)
+            return;
+        for (std::error_code ec : batch) {
+            try {
+                sink_(ec);
+            } catch (...) {
+                // The sink is user code; a throw must not take the timer/
+                // session thread down (same contract as report_error()).
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t dropped() const noexcept {
+        std::lock_guard lock(mtx_);
+        return dropped_;
+    }
+
+private:
+    static constexpr std::size_t kMaxQueued = 256;
+    const std::function<void(std::error_code)> sink_;
+    mutable std::mutex mtx_;
+    std::vector<std::error_code> queue_;
+    std::size_t dropped_ = 0;
+};
 
 // ---------------------------------------------------------------------------
 // EngineConfig
@@ -47,6 +113,12 @@ struct EngineConfig {
     // the caller's, for start-up errors / synchronous sends) – keep it fast
     // and thread-safe, do not re-enter the Engine/session it came from, and
     // never throw out of it (throws are swallowed by the backstop).
+    //
+    // Phase 3 (MUST#1b): failures produced BY the do_send wiring run under
+    // Session::send_mutex_, so they are queued (DeferredErrorSink) and
+    // delivered when the lock is gone — typically still before Session::send
+    // returns (Session::drain_pending_errors), at the latest on the next
+    // timer tick. Everything else still fires inline.
     std::function<void(std::error_code)> on_error;
 };
 
@@ -56,11 +128,13 @@ struct EngineConfig {
 // Lock order (Phase 3, task 3.1): the authoritative statement lives at the
 // top of include/fix/session/session_manager.hpp —
 //     manager → recv → send → store → transport
-// — where "manager" covers both SessionManager::mutex_ and this class's
-// conn_mutex_. Both are top-level registry locks: never nested with each
-// other, never held across a user callback, a join, or an error-sink report
-// (every sweep in src/engine.cpp snapshots under the lock, releases it, then
-// iterates/stops/report).
+// — plus the two leaf error buffers taken from under `send`
+// (Session::pending_err_mtx_ and this class's DeferredErrorSink queue, both
+// documented there). "manager" covers SessionManager::mutex_ and this
+// class's conn_mutex_. Both are top-level registry locks: never nested with
+// each other, never held across a user callback, a join, or an error-sink
+// report (every sweep in src/engine.cpp snapshots under the lock, releases
+// it, then iterates/stops/report).
 // ---------------------------------------------------------------------------
 class Engine {
 public:
@@ -100,7 +174,16 @@ public:
 
     // Audit log
     [[nodiscard]] IAuditLog *audit_log() noexcept { return audit_log_.get(); }
-    void set_audit_log(std::unique_ptr<IAuditLog> log) { audit_log_ = std::move(log); }
+    // Swap the audit sink. Sessions captured the PREVIOUS log by raw pointer
+    // in add_session(), so this re-wires every live session to the new sink —
+    // swapping the member alone would leave them auditing into a destroyed
+    // object (UAF). The rewire-then-swap runs under audit_mtx_, the same
+    // lock add_session() holds across its register+capture pair, so the two
+    // cannot interleave; for_each() iterates a lock-free snapshot, so no
+    // SessionManager lock is held here. Equivalent (and equally correct) to
+    // calling this BEFORE add_session, which wires new sessions to whatever
+    // is installed.
+    void set_audit_log(std::unique_ptr<IAuditLog> log);
 
     [[nodiscard]] bool is_running() const noexcept {
         return running_.load(std::memory_order_acquire);
@@ -111,6 +194,17 @@ private:
     SessionManager sessions_;
     DictionaryRegistry dicts_;
     std::unique_ptr<IAuditLog> audit_log_;
+    // Guards audit_log_ for the two places that swap/capture it (add_session's
+    // register+capture pair and set_audit_log's rewire-then-swap) so a log
+    // cannot be destroyed while a session is being wired to it. Registry-level
+    // lock: never taken under conn_mutex_/SessionManager, never held across a
+    // user callback.
+    std::mutex audit_mtx_;
+    // MUST#1b: transport-send failures queued by the do_send wiring (which
+    // runs under Session::send_mutex_) and drained where no lock is held —
+    // see DeferredErrorSink above. Shared so sessions that outlive this
+    // Engine (stop()'s quarantine) can still drain safely.
+    std::shared_ptr<DeferredErrorSink> deferred_errors_;
 
     std::atomic<bool> running_{false};
     std::thread timer_thread_;

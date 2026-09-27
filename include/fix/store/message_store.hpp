@@ -73,7 +73,19 @@ public:
     // Store a received message (for audit; seq = inbound seq num)
     virtual Result<void> store_inbound(SeqNum seq, const std::string &raw) = 0;
 
-    // Replay outbound messages in [begin, end] (inclusive; 0 = last)
+    // Replay outbound messages in [begin, end] (inclusive; 0 = last).
+    //
+    // MessageCallback contract (NIT#8 — this matters, it is not decoration):
+    // the callback runs SYNCHRONOUSLY, in ascending seq order, and
+    // implementations are allowed to hold their internal store lock across
+    // it (FileStore does — its mutex_ is held for the whole walk). So the
+    // callback must be quick, must not throw, and must not re-enter the
+    // same store (its mutex is non-recursive: a nested get/append would
+    // deadlock). Callers therefore COLLECT inside the callback and do all
+    // real work — I/O, sending, user callbacks — after it returns (see
+    // Session::snapshot_store / handle_resend_request). Sequences absent
+    // from the store are simply not delivered (a gap after purge/reset is
+    // legal and the caller's problem to fill).
     virtual Result<void> get_messages(SeqNum begin, SeqNum end, MessageCallback cb) const = 0;
 
     // Reset (new session)

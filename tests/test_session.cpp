@@ -2,6 +2,7 @@
 // FIX Protocol Engine - Session unit tests
 // =============================================================================
 #include "fix/core/constants.hpp"
+#include "fix/log/message_log.hpp"
 #include "fix/parser/serializer.hpp"
 #include "fix/session/session.hpp"
 #include "fix/store/memory_store.hpp"
@@ -2154,4 +2155,136 @@ TEST(SessionTest, ConcurrentLogonEmitsSingleLogonFrame) {
     EXPECT_EQ(sess.state(), SessionState::LogonSent);
     EXPECT_EQ(sess.store()->next_sender_seq_num(), 2u)
         << "no second numbering round (double reset would keep this at 1)";
+}
+
+// ---------------------------------------------------------------------------
+// MUST#1: a user error sink must NEVER run while Session::send_mutex_ is held
+// ---------------------------------------------------------------------------
+namespace {
+
+// One-shot throwing audit sink, armed only AFTER the handshake (the Logon
+// exchange audits too, and those frames must not trip it). The TX path
+// audits under send_mutex_, so the injected throw produces exactly the
+// report() call site MUST#1 is about: audit_frame() catches it and reports
+// from inside the send lock. The subsequent alert frame audits cleanly
+// (one shot), so the scenario fires once instead of looping back into
+// itself.
+class OneShotThrowingAudit final : public IAuditLog {
+public:
+    void arm() noexcept { armed_.store(true, std::memory_order_release); }
+    void log(AuditEntry entry) override {
+        if (entry.outbound && armed_.exchange(false, std::memory_order_acq_rel))
+            throw std::runtime_error("injected audit failure (MUST#1)");
+    }
+    void flush() override {}
+    void rotate() override {}
+
+private:
+    std::atomic<bool> armed_{false};
+};
+
+} // namespace
+
+TEST(LockOrder, OnErrorNeverRunsUnderSendLock) {
+    // Scenario: a production-style error sink that RE-ENTERS Session::send
+    // (alert-on-error). Before MUST#1 the TX-audit failure was reported
+    // synchronously from under send_mutex_, so this handler would try to
+    // re-lock the same non-recursive mutex and wedge the thread forever.
+    // The watchdog below turns that hang into a fast, diagnosable failure
+    // instead of a stuck ctest run.
+    struct Ctx {
+        std::mutex mtx; // guards `sent` + `errors` (all writers are the worker)
+        std::vector<std::string> sent;
+        std::vector<std::string> errors;
+        OneShotThrowingAudit audit;
+        std::unique_ptr<Session> sess;
+        Session *raw = nullptr;
+        std::atomic<int> on_error_calls{0};
+        std::atomic<bool> reentered{false};
+        std::atomic<bool> trigger_ok{false};
+        std::atomic<bool> alert_ok{false};
+        std::atomic<bool> done{false};
+    };
+    auto ctx = std::make_shared<Ctx>(); // heap: survives a detached watchdog timeout
+
+    // Raw capture ON PURPOSE: these callbacks are stored INSIDE the Session,
+    // which Ctx owns — capturing the shared_ptr here would form the cycle
+    // ctx → sess → cbs_ → ctx and leak (LSAN).
+    Ctx *const self = ctx.get();
+    SessionCallbacks cbs;
+    cbs.do_send = [self](const std::string &s) {
+        std::lock_guard lock(self->mtx);
+        self->sent.push_back(s);
+    };
+    cbs.on_error = [self](const SessionID &, std::string_view what) {
+        self->on_error_calls.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard lock(self->mtx);
+            self->errors.emplace_back(what);
+        }
+        if (!self->raw)
+            return;
+        // Re-enter the send path from INSIDE the sink — the exact pattern
+        // that self-deadlocked when report() ran under send_mutex_.
+        self->reentered.store(true, std::memory_order_release);
+        Message alert(msg_types::Heartbeat);
+        self->alert_ok.store(self->raw->send(alert).has_value(), std::memory_order_release);
+    };
+
+    auto store = std::make_unique<MemoryStore>();
+    ctx->sess = std::make_unique<Session>(make_cfg(false), std::move(store), nullptr, cbs);
+    ctx->raw = ctx->sess.get();
+    ctx->sess->set_audit_log(&ctx->audit);
+
+    std::thread worker([ctx] {
+        handshake_acceptor(*ctx->sess);
+        // Handshake reports (if any) are not the subject here — start the
+        // measurement from zero, then arm the one-shot audit failure.
+        ctx->on_error_calls.store(0, std::memory_order_release);
+        {
+            std::lock_guard lock(ctx->mtx);
+            ctx->errors.clear();
+        }
+        ctx->audit.arm();
+
+        Message hb(msg_types::Heartbeat);
+        ctx->trigger_ok.store(ctx->sess->send(hb).has_value(), std::memory_order_release);
+        ctx->done.store(true, std::memory_order_release);
+    });
+
+    // Watchdog: an in-process send finishes in microseconds; 5 s of silence
+    // means the sink re-entered send() while the lock was held.
+    for (int i = 0; i < 500 && !ctx->done.load(std::memory_order_acquire); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!ctx->done.load(std::memory_order_acquire)) {
+        worker.detach(); // ctx is heap-allocated and shared: nothing dangles
+        FAIL() << "worker never finished — on_error ran (and re-entered "
+                  "Session::send) while send_mutex_ was held (MUST#1 violation)";
+    }
+    worker.join();
+
+    // The injected audit failure reached the sink, exactly once.
+    EXPECT_EQ(ctx->on_error_calls.load(), 1)
+        << "the TX-audit failure must surface through on_error once";
+    ASSERT_EQ(ctx->errors.size(), 1u);
+    EXPECT_NE(ctx->errors.front().find("audit log: entry dropped"), std::string::npos)
+        << "unexpected report: " << ctx->errors.front();
+
+    // The scenario is genuinely live: the handler DID re-enter send(), and
+    // that send succeeded (lock free by then) — nothing was lost, no deadlock.
+    EXPECT_TRUE(ctx->reentered.load()) << "handler never re-entered send (test is vacuous)";
+    EXPECT_TRUE(ctx->trigger_ok.load()) << "the triggering send itself must succeed";
+    EXPECT_TRUE(ctx->alert_ok.load()) << "alert send from on_error must succeed";
+
+    // Both frames left the session: the trigger heartbeat and the alert.
+    {
+        std::lock_guard lock(ctx->mtx);
+        EXPECT_EQ(count_msg_type(ctx->sent, msg_types::Heartbeat), 2u)
+            << "trigger + alert must both be transmitted (got " << ctx->sent.size() << " frames)";
+    }
+
+    // The synchronous error counter was bumped even though the callback ran
+    // later (report() counts immediately, defers only the user callback).
+    EXPECT_GE(ctx->sess->error_count(), 1u);
+    EXPECT_EQ(ctx->sess->state(), SessionState::Active);
 }

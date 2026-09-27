@@ -17,7 +17,19 @@
 //    sequence state is always fsynced, so a crash can at worst lose the
 //    last un-fsynced message frames, never the sequence numbers).
 //  * Filenames embed sanitized CompIDs + qualifier so two sessions can
-//    never collide on the same files (C10).
+//    never collide on the same files (C10). Sanitisation is INJECTIVE
+//    (SHOULD#2): bytes outside [A-Za-z0-9_-] become %XX, empty becomes
+//    "%0", and a component longer than 32 raw bytes carries a
+//    "~<8-hex FNV-1a>" fingerprint — "A/B" and "A_B" can no longer alias
+//    onto one store.
+//  * Files written by the pre-sanitisation layout ("<sender>-<target>.*",
+//    raw, no qualifier) are migrated to the new names on open (SHOULD#4):
+//    a legacy sequence file with no new one present is moved across
+//    (crash-safe order: logs first, seqnums last), so an upgraded process
+//    never silently restarts at seq 1 with its history stranded.
+//  * rebuild_index() drops AND truncates an unterminated trailing record
+//    (a torn write): the partial frame is never indexed (no corrupt
+//    gap-fill) and cannot be concatenated onto by the next append.
 //  * close() is explicit, idempotent, and runs from the destructor.
 // =============================================================================
 #include <atomic>
@@ -104,9 +116,13 @@ public:
         return closed_;
     }
 
-    // Sanitize one path component: keep [A-Za-z0-9_-], map everything else
-    // (/, :, ., spaces, ...) to '_', hard-cap at `cap` characters. Public so
-    // tests can assert the exact contract. Never returns an empty string.
+    // Sanitize one path component INJECTIVELY (SHOULD#2): keep
+    // [A-Za-z0-9_-], %-hex-escape every other byte (uppercase XX), map the
+    // empty component to "%0", and hard-cap at `cap` RAW bytes — on overflow
+    // append "~<8 hex>" (low 32 bits of FNV-1a-64 over the full component)
+    // so truncated names stay unique. Never returns an empty string, never
+    // returns '/', '\\', '.', ':' or a raw '~'. Public so tests can assert
+    // the exact contract.
     static std::string sanitize_component(std::string_view raw, std::size_t cap = 32);
 
 private:
@@ -132,10 +148,18 @@ private:
     // Caller holds mutex_. Crash-safe: tmp file + fsync + atomic rename +
     // parent-dir fsync.
     Result<void> persist_seqs();
-    void rebuild_index();
+    // Re-index the outbound log AND repair it: an unterminated trailing
+    // record (torn write from a crash/power loss) is dropped — never
+    // indexed, so no partial frame is ever resent — and truncated away so
+    // the next append starts on a record boundary. Returns StoreError if
+    // the file exists but cannot be read or the repair truncate fails.
+    Result<void> rebuild_index();
     // Build "<sender>~<target>[~<qualifier>]" with sanitized components.
-    // '~' is the separator precisely because sanitisation removes it from
-    // components, so the encoding is unambiguous and collision-free.
+    // '~' is the separator precisely because sanitisation never lets a RAW
+    // '~' through inside a component ("~" is escaped to %7E), so distinct
+    // SessionIDs always yield distinct filenames (a component over the cap
+    // adds a trailing "~<fingerprint>" whose 8-hex tail cannot be mistaken
+    // for the next separator).
     static std::string make_prefix(const SessionID &sid);
 };
 
