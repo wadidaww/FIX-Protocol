@@ -56,26 +56,62 @@ std::string MessageBuilder::build(std::string_view begin_string, std::string_vie
     return result;
 }
 
-std::string MessageBuilder::serialize(const Message &msg, std::string_view begin_string,
-                                      SeqNum seq_num, std::string_view sender,
-                                      std::string_view target, std::string_view sending_time) {
-    begin(begin_string, msg.msg_type());
-    // Standard header fields (after 8, 9, 35)
-    add(tags::SenderCompID, sender);
-    add(tags::TargetCompID, target);
-    add(tags::MsgSeqNum, static_cast<std::int64_t>(seq_num));
-    add(tags::SendingTime, sending_time);
+// Strict serializer: same output as serialize(), but surfaces the first
+// rejected field value instead of collapsing to "". Header emission order
+// (8, 9, 35, 49, 56, 34, [43], [122], 52) and checksum/body-length math in
+// build() are unchanged — this only adds per-field validation on top.
+Result<std::string> MessageBuilder::try_serialize(const Message &msg, std::string_view begin_string,
+                                                  SeqNum seq_num, std::string_view sender,
+                                                  std::string_view target,
+                                                  std::string_view sending_time) {
+    if (auto r = begin(begin_string, msg.msg_type()); !r)
+        return std::unexpected(r.error());
 
-    // Body fields (skip header/trailer tags we already handle)
+    // Standard header fields (after 8, 9, 35).
+    // F5: 43 (PossDupFlag) and 122 (OrigSendingTime) are STANDARD HEADER
+    // tags — the parser whitelists them in is_standard_header_tag() — but the
+    // serializer used to emit them from the body loop, i.e. AFTER 52
+    // SendingTime, on every resend replay. They now take their header
+    // position: 34, 43, 122, 52 (both omitted when absent, which is the
+    // overwhelming majority of frames — nothing else changes on the wire).
+    const auto field_of = [&msg](TagNum t) -> const Field * {
+        for (const auto &f : msg.fields())
+            if (f.tag == t)
+                return &f;
+        return nullptr;
+    };
+    if (auto r = add(tags::SenderCompID, sender); !r)
+        return std::unexpected(r.error());
+    if (auto r = add(tags::TargetCompID, target); !r)
+        return std::unexpected(r.error());
+    if (auto r = add(tags::MsgSeqNum, static_cast<std::int64_t>(seq_num)); !r)
+        return std::unexpected(r.error());
+    if (const Field *poss_dup = field_of(tags::PossDupFlag))
+        if (auto r = add(tags::PossDupFlag, poss_dup->value); !r)
+            return std::unexpected(r.error());
+    if (const Field *orig_time = field_of(tags::OrigSendingTime))
+        if (auto r = add(tags::OrigSendingTime, orig_time->value); !r)
+            return std::unexpected(r.error());
+    if (auto r = add(tags::SendingTime, sending_time); !r)
+        return std::unexpected(r.error());
+
+    // Body fields (skip header/trailer tags we already handle — the skip set
+    // MUST mirror the emission above plus is_standard_header_tag(), or a
+    // field would appear twice).
     for (const auto &f : msg.fields()) {
         if (f.tag == tags::BeginString || f.tag == tags::BodyLength || f.tag == tags::MsgType ||
             f.tag == tags::SenderCompID || f.tag == tags::TargetCompID ||
-            f.tag == tags::MsgSeqNum || f.tag == tags::SendingTime || f.tag == tags::CheckSum) {
+            f.tag == tags::MsgSeqNum || f.tag == tags::PossDupFlag ||
+            f.tag == tags::OrigSendingTime || f.tag == tags::SendingTime ||
+            f.tag == tags::CheckSum) {
             continue;
         }
-        add(f.tag, f.value);
+        if (auto r = add(f.tag, f.value); !r)
+            return std::unexpected(r.error());
     }
-    return finish();
+    if (last_error_)
+        return std::unexpected(last_error_);
+    return build(begin_string_, body_);
 }
 
 std::string MessageBuilder::format_timestamp(TimePoint tp) {

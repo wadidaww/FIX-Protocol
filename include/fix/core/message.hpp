@@ -16,55 +16,143 @@
 namespace fix {
 
 // ---------------------------------------------------------------------------
+// Wire-character validation (framing safety, C8)
+//
+// A FIX field value must never contain NUL (0x00) or SOH (0x01): SOH is the
+// field delimiter, so embedding it in a value would inject additional
+// Tag=Value fields on the wire; NUL corrupts C-string consumers downstream.
+// Every API that accepts a field value (Message::set/add, MessageBuilder)
+// validates through this helper and rejects the value.
+//
+// Other C0 control bytes are deliberately NOT rejected here: they are
+// spec-invalid but do not break SOH framing, and being conservative avoids
+// rejecting data a counterparty might legitimately (if unusually) send.
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline bool has_invalid_wire_chars(std::string_view value) noexcept {
+    for (unsigned char c : value) {
+        if (c == 0x00 || c == 0x01)
+            return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // A FIX message: ordered list of fields, plus metadata extracted at parse time
+//
+// Field access rules:
+//  * set(tag, ...)  — upsert semantics for application use: replaces the value
+//                     of the FIRST existing occurrence, or appends.
+//  * add(tag, ...)  — always appends, preserving wire order. Used by the
+//                     parser so repeating groups (duplicate body tags) are
+//                     retained instead of deduplicated (C7).
+//  * get(tag)       — FIRST-occurrence-wins: returns the earliest stored
+//                     field with that tag. Header fields are parsed before
+//                     body fields, so header accessors (seq_num(),
+//                     sender_comp_id(), ...) return the first-seen value even
+//                     if a duplicate slipped through.
+//  * get_all(tag)   — all occurrences in stored (wire) order.
+//
+// set()/add() return Result<void>: values are validated with
+// has_invalid_wire_chars(); an invalid value is rejected and the message left
+// unchanged. The result is intentionally NOT [[nodiscard]] so existing
+// void-style call sites (session, apps, README examples) keep compiling —
+// callers that must not silently drop a field should check it.
 // ---------------------------------------------------------------------------
 class Message {
 public:
     Message() = default;
-    explicit Message(std::string_view msg_type) { set(tags::MsgType, msg_type); }
+    explicit Message(std::string_view msg_type) { (void)set(tags::MsgType, msg_type); }
 
     // --- Field access -------------------------------------------------------
-    void set(TagNum tag, std::string_view value) {
+    // Upsert. Rejects values containing NUL/SOH (see has_invalid_wire_chars).
+    Result<void> set(TagNum tag, std::string_view value) {
+        if (has_invalid_wire_chars(value))
+            return make_unexpected(ErrorCode::InvalidField);
         for (auto &f : fields_) {
             if (f.tag == tag) {
                 f.value = value;
-                return;
+                return {};
             }
         }
         fields_.emplace_back(tag, value);
+        return {};
     }
 
     // Explicit const char* overload to prevent char*→bool conversion
-    void set(TagNum tag, const char *value) { set(tag, std::string_view(value)); }
+    Result<void> set(TagNum tag, const char *value) { return set(tag, std::string_view(value)); }
 
-    void set(TagNum tag, std::string v) {
+    Result<void> set(TagNum tag, std::string v) {
+        if (has_invalid_wire_chars(v))
+            return make_unexpected(ErrorCode::InvalidField);
         for (auto &f : fields_) {
             if (f.tag == tag) {
                 f.value = std::move(v);
-                return;
+                return {};
             }
         }
         fields_.emplace_back(tag, std::move(v));
+        return {};
     }
 
-    void set(TagNum tag, std::int64_t value) { set(tag, std::to_string(value)); }
+    Result<void> set(TagNum tag, std::int64_t value) { return set(tag, std::to_string(value)); }
 
-    void set(TagNum tag, double value) {
+    Result<void> set(TagNum tag, double value) {
         char buf[64];
         auto res = std::to_chars(buf, buf + sizeof(buf), value, std::chars_format::fixed, 6);
-        set(tag, std::string_view(buf, res.ptr));
+        return set(tag, std::string_view(buf, res.ptr));
     }
 
-    void set(TagNum tag, bool value) {
-        set(tag, value ? std::string_view("Y") : std::string_view("N"));
+    Result<void> set(TagNum tag, bool value) {
+        return set(tag, value ? std::string_view("Y") : std::string_view("N"));
     }
 
+    // Append a NEW occurrence of `tag` (repeating groups / duplicate tags),
+    // preserving wire order. Rejects NUL/SOH values like set().
+    Result<void> add(TagNum tag, std::string_view value) {
+        if (has_invalid_wire_chars(value))
+            return make_unexpected(ErrorCode::InvalidField);
+        fields_.emplace_back(tag, value);
+        return {};
+    }
+
+    Result<void> add(TagNum tag, const char *value) { return add(tag, std::string_view(value)); }
+
+    Result<void> add(TagNum tag, std::string v) {
+        if (has_invalid_wire_chars(v))
+            return make_unexpected(ErrorCode::InvalidField);
+        fields_.emplace_back(tag, std::move(v));
+        return {};
+    }
+
+    Result<void> add(TagNum tag, std::int64_t value) { return add(tag, std::to_string(value)); }
+
+    Result<void> add(TagNum tag, double value) {
+        char buf[64];
+        auto res = std::to_chars(buf, buf + sizeof(buf), value, std::chars_format::fixed, 6);
+        return add(tag, std::string_view(buf, res.ptr));
+    }
+
+    Result<void> add(TagNum tag, bool value) {
+        return add(tag, value ? std::string_view("Y") : std::string_view("N"));
+    }
+
+    // First-occurrence-wins (see class comment).
     [[nodiscard]] std::optional<std::string_view> get(TagNum tag) const noexcept {
         for (const auto &f : fields_) {
             if (f.tag == tag)
                 return f.value;
         }
         return std::nullopt;
+    }
+
+    // All occurrences of `tag`, in stored (wire) order — repeating groups.
+    [[nodiscard]] std::vector<std::string_view> get_all(TagNum tag) const {
+        std::vector<std::string_view> out;
+        for (const auto &f : fields_) {
+            if (f.tag == tag)
+                out.push_back(f.value);
+        }
+        return out;
     }
 
     [[nodiscard]] bool has(TagNum tag) const noexcept { return get(tag).has_value(); }
@@ -123,6 +211,16 @@ public:
         return get(tags::PossDupFlag).value_or("N") == "Y";
     }
 
+    // --- Duplicate standard-header detection (C7) ---------------------------
+    // Set by StreamParser when a standard-header tag (8/9/35/49/50/56/57/115/
+    // 128/90/91/34/43/122/52/10) appeared more than once in one message
+    // (FIX session Reject reason 13, TagAppearsMoreThanOnce). The message is
+    // still delivered — first occurrence of each header field wins — so the
+    // session layer can send a proper Reject and consume the sequence number.
+    // The parser also surfaces ErrorCode::DuplicateField via last_error().
+    [[nodiscard]] bool has_duplicate_header() const noexcept { return duplicate_header_; }
+    void mark_duplicate_header() noexcept { duplicate_header_ = true; }
+
     // --- Direct field list access -------------------------------------------
     [[nodiscard]] const std::vector<Field> &fields() const noexcept { return fields_; }
     [[nodiscard]] std::vector<Field> &fields() noexcept { return fields_; }
@@ -130,6 +228,7 @@ public:
     void clear() {
         fields_.clear();
         raw_.clear();
+        duplicate_header_ = false;
     }
 
     // Store the original raw bytes (for audit log / retransmission)
@@ -139,6 +238,7 @@ public:
 private:
     std::vector<Field> fields_;
     std::string raw_; // original wire bytes
+    bool duplicate_header_ = false;
 };
 
 // Convenience alias

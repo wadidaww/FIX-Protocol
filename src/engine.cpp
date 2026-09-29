@@ -8,6 +8,36 @@
 
 namespace fix {
 
+namespace {
+
+// Intentional leak, see Engine::stop(): a transport whose IO thread is the
+// current thread can never be joined or destroyed on this thread (~thread on
+// a joinable std::thread aborts the process). Parking the entry in a heap
+// allocation that is deliberately never freed keeps the joinable thread object
+// alive for the rest of the process' life; stop() has already requested
+// shutdown, so the IO thread exits on its own.
+template <typename T>
+void quarantine(T entry) {
+    static auto *sink = new std::vector<T>; // never deleted – on purpose
+    sink->push_back(std::move(entry));
+}
+
+// Invoke the engine error sink from an exception backstop. The sink is user
+// code and may itself throw, so every path here is guarded: a throwing sink
+// must not take the timer/IO/shutdown thread down with it. noexcept on
+// purpose – this is the last line of defence.
+void report_error(const std::function<void(std::error_code)> &sink, std::error_code ec) noexcept {
+    if (!sink)
+        return;
+    try {
+        sink(ec);
+    } catch (...) {
+        // Nothing sensible left to report to; swallow so the caller survives.
+    }
+}
+
+} // namespace
+
 Engine::Engine(EngineConfig cfg)
     : cfg_(std::move(cfg)) {
     if (cfg_.enable_audit) {
@@ -18,6 +48,10 @@ Engine::Engine(EngineConfig cfg)
     } else {
         audit_log_ = std::make_unique<NullAuditLog>();
     }
+    // MUST#1b: one queue for every session's do_send wiring (see
+    // DeferredErrorSink). Holds a COPY of the sink — the queue outlives this
+    // Engine when a quarantined session drains after stop().
+    deferred_errors_ = std::make_shared<DeferredErrorSink>(cfg_.on_error);
 }
 
 Engine::~Engine() {
@@ -32,17 +66,64 @@ Result<void> Engine::start() {
     timer_thread_ = std::thread([this] {
         while (running_.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(cfg_.timer_interval_ms));
-            sessions_.tick_all();
+            // Backstop (2.6): tick each session behind an exception boundary —
+            // Session::on_timer reaches user callbacks (on_heartbeat_timeout),
+            // do_send and do_disconnect with no catch of its own, and Session
+            // only catches std::exception per *inbound message* deeper down.
+            // A throw here (std or not) must not unwind out of the thread
+            // entry (std::terminate) nor starve the other sessions: catch per
+            // session, keep ticking, report afterwards. Reporting the TICK's
+            // own backstop error is deferred until after for_each() returns so
+            // it never runs inside the session pass (3.1: for_each only takes
+            // SessionManager's lock to snapshot the list, but a sink
+            // re-entering the Engine — e.g. add/remove_session — must still not
+            // run mid-iteration). MUST#1: inside the pass, each session's
+            // deferred-error drain may invoke EngineConfig::on_error — that is
+            // safe because for_each iterates a lock-free snapshot (no manager
+            // lock is held across the callback) and its contract already
+            // allows create_session/remove_session from inside fn.
+            std::error_code cb_error;
+            try {
+                sessions_.for_each([&cb_error](Session &s) {
+                    try {
+                        s.on_timer();
+                    } catch (const std::exception &) {
+                        cb_error = make_error_code(ErrorCode::SessionError);
+                    } catch (...) {
+                        cb_error = make_error_code(ErrorCode::SessionError);
+                    }
+                });
+                // Sessions removed from a session callback (their own IO
+                // thread) are reaped here: join the IO thread, then destroy –
+                // never on the IO thread itself (that would ~thread-abort).
+                drain_reap_list();
+            } catch (...) {
+                cb_error = make_error_code(ErrorCode::SessionError);
+            }
+            if (cb_error)
+                report_error(cfg_.on_error, cb_error);
+            // MUST#1b: the same place that already defers the tick's backstop
+            // report also drains the engine error queue — no session lock is
+            // held here. Sessions drain it themselves after each send-path
+            // lock scope; this catches anything left behind by a session that
+            // was removed (or parked in quarantine) before its own drain.
+            deferred_errors_->drain();
         }
     });
 
-    // Start all registered transports
+    // Snapshot under the lock, start outside it: start() may join a stale
+    // thread left by an earlier stop()-from-callback, and that thread could be
+    // inside a session callback calling Engine::remove_session() (which takes
+    // conn_mutex_) – holding the lock across start() deadlocks.
+    std::vector<std::shared_ptr<ITransport>> transports;
     {
         std::lock_guard lock(conn_mutex_);
-        for (auto &conn : connections_) {
-            conn.transport->start();
-        }
+        transports.reserve(connections_.size());
+        for (const auto &conn : connections_)
+            transports.push_back(conn.transport);
     }
+    for (const auto &transport : transports)
+        (void)transport->start();
 
     return {};
 }
@@ -50,67 +131,331 @@ Result<void> Engine::start() {
 void Engine::stop() {
     if (!running_.exchange(false))
         return;
-    if (timer_thread_.joinable())
-        timer_thread_.join();
-
-    // Logout all sessions
-    sessions_.for_each([](Session &s) {
-        if (s.is_active()) {
-            s.logout("Engine shutdown");
-        }
-    });
-
-    // Stop all transports
-    std::lock_guard lock(conn_mutex_);
-    for (auto &conn : connections_) {
-        conn.transport->stop();
+    if (timer_thread_.joinable()) {
+        if (timer_thread_.get_id() == std::this_thread::get_id() || on_transport_io_thread())
+            // Called from the timer callback itself (joining self aborts) or
+            // from a transport IO thread (the timer may currently be joining
+            // *this* thread in drain_reap_list() – joining it back would
+            // deadlock). Detach instead: the loop exits on its next iteration
+            // because running_ is already false. stop()-from-a-callback is a
+            // documented contract violation anyway; the quarantine below is
+            // the backstop, not a supported path.
+            timer_thread_.detach();
+        else
+            timer_thread_.join();
     }
-    connections_.clear();
+
+    // Logout all sessions. Backstop (2.6): logout() runs do_send and may reach
+    // user callbacks (a peer's Logout echo invokes on_logout on its IO thread;
+    // session changes may invoke it inline) — Session only catches
+    // std::exception per inbound message deeper down, so a throw here would
+    // abort Engine::stop() halfway and leave IO threads unjoined (wedged
+    // process). Catch per session, never rethrow, report after for_each()
+    // returns so the sink runs outside the session pass (3.1: for_each
+    // snapshots under SessionManager's lock and iterates lock-free, but the
+    // sink is still deferred to keep user code out of the iteration).
+    std::error_code cb_error;
+    try {
+        sessions_.for_each([&cb_error](Session &s) {
+            if (!s.is_active())
+                return;
+            try {
+                s.logout("Engine shutdown");
+            } catch (const std::exception &) {
+                cb_error = make_error_code(ErrorCode::SessionError);
+            } catch (...) {
+                cb_error = make_error_code(ErrorCode::SessionError);
+            }
+        });
+    } catch (...) {
+        cb_error = make_error_code(ErrorCode::SessionError);
+    }
+    if (cb_error)
+        report_error(cfg_.on_error, cb_error);
+    // The logout pass above sent frames (and could therefore have queued
+    // transport failures under send_mutex_ — MUST#1b): surface them before
+    // the sessions go away.
+    deferred_errors_->drain();
+
+    // Snapshot under the lock, stop outside it: stop() joins the transport IO
+    // threads, and a callback running on one of them may re-enter the Engine
+    // (remove_session/stop) which takes conn_mutex_ – holding it across the
+    // join deadlocks (reproduced).
+    std::vector<Connection> conns;
+    {
+        std::lock_guard lock(conn_mutex_);
+        conns = std::move(connections_);
+        connections_.clear(); // moved-from state must not be relied upon
+    }
+    for (auto &conn : conns) {
+        const bool self = conn.transport->on_io_thread();
+        conn.transport->stop(); // self: requests shutdown but cannot join
+        if (self) {
+            // This IO thread *is* us: park the entry for the reap pass below,
+            // which quarantines anything still owned by this thread.
+            std::lock_guard lock(conn_mutex_);
+            reap_list_.push_back(std::move(conn));
+        }
+        // else: joined here; conn is released at the end of the iteration,
+        // i.e. the session is destroyed only after its IO thread is gone.
+    }
+
+    // The timer thread is gone, so nothing else drains the reap list: do a
+    // synchronous pass now (joins everything not owned by this thread), then
+    // quarantine what remains.
+    drain_reap_list();
+}
+
+void Engine::drain_reap_list() {
+    std::vector<Connection> reap;
+    {
+        std::lock_guard lock(conn_mutex_);
+        reap.swap(reap_list_);
+    }
+    // Join outside the lock: the IO thread being joined may itself call
+    // remove_session()/stop(), both of which take conn_mutex_.
+    for (auto &conn : reap) {
+        if (conn.transport->on_io_thread()) {
+            // Owned by this thread – stop() only requests shutdown here;
+            // destroying the joinable thread object on its own thread would
+            // abort, so park it in the quarantine instead.
+            // #6: a quarantined session is NEVER destroyed — but the Engine's
+            // audit log is (Engine dtor). Detach the raw pointer before the
+            // conn leaves the Engine's care so a late frame cannot audit into
+            // a freed IAuditLog (audit_frame null-checks, so auditing simply
+            // stops for a session that is already being torn down).
+            conn.session->set_audit_log(nullptr);
+            conn.transport->stop();
+            quarantine(std::move(conn));
+        } else {
+            conn.transport->stop(); // joins; conn released after the join
+        }
+    }
 }
 
 Session *Engine::add_session(SessionConfig cfg, std::unique_ptr<ITransport> transport,
                              SessionCallbacks user_cbs, const DataDictionary *dict) {
-    // Wire up transport → session
-    SessionCallbacks internal_cbs = user_cbs;
+    if (!transport)
+        return nullptr;
+
+    // The transport is shared: the session's do_send/do_disconnect closures,
+    // the Connection and the (weak) transport callbacks all need to keep it
+    // alive, and stop() must be able to join its IO thread before anything is
+    // destroyed.
+    auto shared_transport = std::shared_ptr<ITransport>(std::move(transport));
+
+    // Wire session → transport *before* the session is created: the closures
+    // only capture the transport, which already exists at this point.
+    SessionCallbacks internal_cbs = std::move(user_cbs);
+    internal_cbs.do_send = [t = shared_transport,
+                            errs = deferred_errors_](const std::string &bytes) {
+        // 2.6: the transport Result used to be discarded ((void) cast) — a
+        // failed write (peer gone, EPIPE, torn-down socket) vanished without a
+        // trace. Surface it on the engine error sink; error_code already
+        // carries the fix::ErrorCode message.
+        //
+        // MUST#1b: this lambda runs under Session::send_mutex_ (see the
+        // ACCEPTED BOUNDARY in session_manager.hpp), so it must NOT invoke
+        // the user sink inline — push into the engine's deferred queue
+        // (lock order send → engine-error-queue) and let the session drain
+        // it as soon as its own lock scope ends.
+        auto sent = t->send(bytes);
+        if (!sent)
+            errs->push(sent.error());
+    };
+    // ...and the matching drain: Session calls this from
+    // drain_pending_errors() AFTER every send-path lock scope and from
+    // on_timer(), i.e. with no session lock held.
+    internal_cbs.drain_deferred_errors = [errs = deferred_errors_] {
+        errs->drain();
+    };
+    // Session::disconnect() (CompID mismatch, heartbeat timeout, …) must
+    // actually close the socket, otherwise a hostile peer pins the acceptor's
+    // event loop forever and initiators never reconnect (F1).
+    internal_cbs.do_disconnect = [t = shared_transport] {
+        t->disconnect();
+    };
 
     // Create store
     std::unique_ptr<IMessageStore> store;
     if (cfg_.use_file_store) {
-        store = std::make_unique<FileStore>(cfg_.store_dir, cfg.id);
+        // 3.4: open() is the non-throwing path — a corrupt/truncated seq
+        // file REFUSES to start the session (StoreError) instead of the
+        // legacy ctor's silent reset to 1 (sequence-hijack finding C10).
+        auto fs = FileStore::open(cfg_.store_dir, cfg.id, {.fsync_messages = cfg_.fsync_messages});
+        if (!fs) {
+            report_error(cfg_.on_error, fs.error());
+            return nullptr;
+        }
+        store = std::move(*fs);
     } else {
         store = std::make_unique<MemoryStore>();
     }
 
-    Session *sess = sessions_.create_session(std::move(cfg), std::move(store), dict, internal_cbs);
-
-    if (transport) {
-        transport->set_on_connected([sess] {
-            if (sess->id().version >= FixVersion::FIX_4_2) {
-                // Initiator automatically sends Logon on connect
-                // (acceptors wait)
-                // The SessionConfig.initiator flag controls this
-            }
-        });
-        transport->set_on_data(
-            [sess](const char *data, std::size_t len) { sess->on_data(data, len); });
-        transport->set_on_disconnected([sess](std::string_view reason) { sess->disconnect(); });
-
-        // Wire session send → transport
-        // We need to update the session's do_send callback
-        // Since Session callbacks are set at construction, we do it via a shared
-        // transport pointer approach. This is a design limitation we handle by
-        // setting the do_send on the session after creation.
-        // For now, we store the connection and let the session use it directly.
-
-        std::lock_guard lock(conn_mutex_);
-        connections_.push_back({std::move(transport), sess});
+    std::shared_ptr<Session> session;
+    {
+        //3.5: RX/TX audit wiring — without this, production sessions silently
+        // used NullAuditLog (sessions in unit tests were wired directly).
+        //
+        // Registration + capture happen atomically under audit_mtx_, which
+        // set_audit_log() also holds across its rewire-then-swap: a session
+        // can therefore never register under the OLD log while a swap
+        // destroys it — it either is in the swap's for_each snapshot (gets
+        // re-wired) or registers after the swap (captures the new log).
+        // audit_mtx_ is a registry-level lock like conn_mutex_: taken here and
+        // in set_audit_log only, never across a user callback (the failure
+        // report below runs outside it) and always before SessionManager's
+        // lock, never after.
+        std::lock_guard audit_lock(audit_mtx_);
+        session = sessions_.create_session(std::move(cfg), std::move(store), dict,
+                                           std::move(internal_cbs));
+        if (session)
+            session->set_audit_log(audit_log_.get());
+    }
+    if (!session) {
+        // Duplicate SessionID – never silently replace. Report it (#9): both
+        // nullptr causes a caller can hit here (this one and the store-open
+        // failure above, which already reports) are now observable on the
+        // engine sink instead of one of them vanishing into a bare nullptr.
+        // Invoked OUTSIDE audit_mtx_ (user code may re-enter the Engine).
+        report_error(cfg_.on_error, make_error_code(ErrorCode::SessionError));
+        return nullptr;
     }
 
-    return sess;
+    // Wire transport → session. Callbacks capture a weak_ptr: a session that is
+    // removed while the transport IO thread is still draining cannot be
+    // touched after destruction. Each callback is an exception backstop (2.6):
+    // they run on the transport's IO thread, Session only catches
+    // std::exception per inbound message deeper down, and an exception
+    // escaping into the transport event loop would terminate the IO thread —
+    // catch (std and non-std), report on the engine sink, keep the loop alive.
+    // The sink is captured by value (not `this`): a transport may be parked in
+    // Engine's never-destroyed quarantine and outlive the Engine itself.
+    std::weak_ptr<Session> weak = session;
+    shared_transport->set_on_connected([weak, sink = cfg_.on_error] {
+        try {
+            if (auto s = weak.lock())
+                s->on_transport_connected();
+        } catch (const std::exception &) {
+            report_error(sink, make_error_code(ErrorCode::SessionError));
+        } catch (...) {
+            report_error(sink, make_error_code(ErrorCode::SessionError));
+        }
+    });
+    shared_transport->set_on_data([weak, sink = cfg_.on_error](const char *data, std::size_t len) {
+        try {
+            if (auto s = weak.lock())
+                s->on_data(data, len);
+        } catch (const std::exception &) {
+            report_error(sink, make_error_code(ErrorCode::SessionError));
+        } catch (...) {
+            report_error(sink, make_error_code(ErrorCode::SessionError));
+        }
+    });
+    shared_transport->set_on_disconnected(
+        [weak, sink = cfg_.on_error](std::string_view /*reason*/) {
+            try {
+                if (auto s = weak.lock())
+                    s->disconnect();
+            } catch (const std::exception &) {
+                report_error(sink, make_error_code(ErrorCode::SessionError));
+            } catch (...) {
+                report_error(sink, make_error_code(ErrorCode::SessionError));
+            }
+        });
+    // Transport errors used to be fired into the void (set_on_error was never
+    // called): surface them on the engine-level sink instead (F6). Backstop:
+    // the sink is user code invoked from deep inside the transport event loop
+    // — a throw there would take the IO thread down, so swallow it (the sink
+    // already failed once; there is nothing else to report to).
+    shared_transport->set_on_error(
+        [sink = cfg_.on_error](std::error_code ec) { report_error(sink, ec); });
+
+    bool should_start = false;
+    {
+        std::lock_guard lock(conn_mutex_);
+        connections_.push_back({shared_transport, session});
+        // add_session() after start(): start the transport below – Engine::
+        // start() only sweeps the connections that existed when it ran.
+        should_start = running_.load(std::memory_order_acquire);
+    }
+    if (should_start) {
+        // Start *outside* conn_mutex_: start() may join a stale thread left
+        // by an earlier stop()-from-callback, and that thread could be inside
+        // a session callback that calls Engine::remove_session() (which takes
+        // conn_mutex_) – holding the lock across start() deadlocks (F4).
+        if (!shared_transport->start().has_value()) {
+            // Roll back under a brief lock re-acquire, then stop outside it.
+            bool owned = false;
+            {
+                std::lock_guard lock(conn_mutex_);
+                auto it = std::find_if(connections_.begin(), connections_.end(),
+                                       [&shared_transport](const Connection &c) {
+                                           return c.transport == shared_transport;
+                                       });
+                if (it != connections_.end()) {
+                    connections_.erase(it);
+                    owned = true;
+                }
+            }
+            if (owned)
+                shared_transport->stop();
+            (void)sessions_.remove(session->id());
+            return nullptr;
+        }
+    }
+
+    return session.get();
 }
 
 bool Engine::remove_session(const SessionID &sid) {
-    return sessions_.remove(sid);
+    Connection conn;
+    bool found = false;
+    {
+        std::lock_guard lock(conn_mutex_);
+        auto it =
+            std::find_if(connections_.begin(), connections_.end(), [&sid](const Connection &c) {
+                return c.session && c.session->id() == sid;
+            });
+        if (it != connections_.end()) {
+            // Drop the connection first so a concurrent Engine::start()/stop()
+            // cannot resurrect it; the local Connection keeps both alive.
+            conn = std::move(*it);
+            connections_.erase(it);
+            found = true;
+        }
+    }
+    // Remove from the manager immediately so lookups fail from here on. The
+    // local Connection (or the reap entry below) keeps the session alive until
+    // its transport IO thread has been joined.
+    const bool removed = sessions_.remove(sid);
+
+    if (found) {
+        if (conn.transport->on_io_thread()) {
+            // Called from this transport's own IO thread (a session callback):
+            // stop() cannot join itself, and destroying the joinable thread
+            // here would abort (~thread). Park the entry for the timer thread,
+            // which reaps it off this thread (F3). sessions_.remove above
+            // already ran, so lookups fail while the reap entry holds the last
+            // strong reference.
+            // #6: the entry parked here may end up in the quarantine instead
+            // of being destroyed (drain_reap_list reaps whatever the calling
+            // thread owns) — a session that then outlives the Engine must not
+            // keep pointing at its audit log, so detach it here too; the
+            // quarantine branch in drain_reap_list does the same for entries
+            // parked by stop(). audit_frame null-checks, so auditing simply
+            // stops once the session has been removed from the Engine.
+            conn.session->set_audit_log(nullptr);
+            std::lock_guard lock(conn_mutex_);
+            reap_list_.push_back(std::move(conn));
+        } else {
+            // Stop + join the IO thread *outside* conn_mutex_ (never hold it
+            // across a join – F4); the session is destroyed after the join
+            // when `conn` goes out of scope.
+            conn.transport->stop();
+        }
+    }
+    return removed;
 }
 
 Session *Engine::get_session(const SessionID &sid) noexcept {
@@ -132,6 +477,20 @@ void Engine::load_builtin_dictionary(FixVersion v) {
 
 const DataDictionary *Engine::dictionary(FixVersion v) const noexcept {
     return DictionaryRegistry::instance().get(v);
+}
+
+void Engine::set_audit_log(std::unique_ptr<IAuditLog> log) {
+    // #5: sessions captured the PREVIOUS log by raw pointer in add_session(),
+    // so swapping the member alone would leave them auditing into a destroyed
+    // IAuditLog (UAF) — re-wire every live session first, then install the
+    // new sink, both under audit_mtx_ (the same lock add_session() holds
+    // across register+capture, so the two cannot interleave; see the comment
+    // there). for_each() iterates a lock-free snapshot of the registry, so
+    // no SessionManager lock is held across the callback and re-entrancy into
+    // the session (set_audit_log is a plain atomic store) is safe.
+    std::lock_guard audit_lock(audit_mtx_);
+    sessions_.for_each([raw = log.get()](Session &s) { s.set_audit_log(raw); });
+    audit_log_ = std::move(log);
 }
 
 } // namespace fix
