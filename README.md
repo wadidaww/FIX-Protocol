@@ -73,6 +73,17 @@ cd build && ctest --output-on-failure
 | `FIX_ENABLE_UBSAN`  | OFF     | Enable UBSanitizer                       |
 | `FIX_ENABLE_LTO`    | OFF     | Enable Link-Time Optimisation            |
 | `FIX_NO_EXCEPTIONS` | OFF     | Build with `-fno-exceptions`             |
+| `FIX_BUILD_BENCHMARKS` | OFF  | Build Google Benchmark microbenchmarks   |
+
+### Benchmarks
+```bash
+cmake -B build-bench -G Ninja -DCMAKE_BUILD_TYPE=Release -DFIX_BUILD_BENCHMARKS=ON
+cmake --build build-bench --target fix_bench
+./build-bench/fix_bench
+```
+See [docs/benchmarks.md](docs/benchmarks.md) for what is measured and baseline
+results (e.g. ~0.8 µs to parse and ~0.5 µs to serialise a NewOrderSingle,
+~2.5 µs for a full in-memory session round trip).
 
 ## Usage
 
@@ -138,6 +149,7 @@ include/fix/
   log/          message_log.hpp
   engine.hpp
 src/            Implementation files
+benchmarks/     Google Benchmark microbenchmarks
 tests/          Google Test unit tests (56 tests)
 apps/oms/       Reference OMS application
 .github/workflows/ci.yml   GitHub Actions CI
@@ -150,6 +162,7 @@ GitHub Actions pipeline runs on every push:
 - Windows (MSVC 2022)
 - AddressSanitizer + UBSanitizer
 - ThreadSanitizer
+- Benchmarks (smoke run; results uploaded as an artifact, not gated)
 
 ## License
 See [LICENSE](LICENSE).

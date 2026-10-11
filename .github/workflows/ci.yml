@@ -26,7 +26,7 @@ jobs:
         run: sudo apt-get install -y clang-format-18
       - name: Check formatting
         run: |
-          find include src tests apps \( -name "*.cpp" -o -name "*.hpp" \) \
+          find include src tests apps benchmarks \( -name "*.cpp" -o -name "*.hpp" \) \
             | xargs clang-format-18 --dry-run --Werror --style=file
 
   # ---------------------------------------------------------------------------
@@ -168,6 +168,56 @@ jobs:
         env:
           TSAN_OPTIONS: second_deadlock_stack=1:halt_on_error=1
         run: ctest --output-on-failure --timeout 120 -j$(nproc)
+
+  # ---------------------------------------------------------------------------
+  # Benchmarks (smoke run: checks they build and run; numbers from shared
+  # runners are noisy, so they are uploaded for reference, not gated)
+  # ---------------------------------------------------------------------------
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      CC:  gcc-14
+      CXX: g++-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc-14 g++-14
+
+      - name: Configure
+        run: |
+          cmake -B build-bench \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DFIX_BUILD_TESTS=OFF \
+            -DFIX_BUILD_APPS=OFF \
+            -DFIX_BUILD_BENCHMARKS=ON
+
+      - name: Build
+        run: cmake --build build-bench --target fix_bench --parallel $(nproc)
+
+      - name: Run benchmarks
+        run: |
+          ./build-bench/fix_bench \
+            --benchmark_min_time=0.2s \
+            --benchmark_out=benchmark-results.json \
+            --benchmark_out_format=json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.json
 
   # ---------------------------------------------------------------------------
   # macOS build
