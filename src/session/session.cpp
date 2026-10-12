@@ -127,14 +127,23 @@ Session::Millis Session::now_ms() noexcept {
 }
 
 Session::Millis Session::clock_now() const {
+#if defined(__cpp_lib_atomic_shared_ptr)
     auto fn = clock_.load(std::memory_order_acquire);
+#else
+    auto fn = std::atomic_load_explicit(&clock_, std::memory_order_acquire);
+#endif
     if (fn && *fn)
         return (*fn)();
     return now_ms();
 }
 
 void Session::set_time_source_for_test(std::function<Millis()> clock) {
-    clock_.store(std::make_shared<const ClockFn>(std::move(clock)), std::memory_order_release);
+    auto fn = std::make_shared<const ClockFn>(std::move(clock));
+#if defined(__cpp_lib_atomic_shared_ptr)
+    clock_.store(std::move(fn), std::memory_order_release);
+#else
+    std::atomic_store_explicit(&clock_, std::move(fn), std::memory_order_release);
+#endif
     // Re-baseline every deadline against the new source: the previous values
     // are wall-clock instants that would look wildly far off relative to a
     // test clock, firing (or never firing) timers immediately. Message

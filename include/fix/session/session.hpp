@@ -293,8 +293,14 @@ private:
     static Millis now_ms() noexcept;
     // Virtual clock: null → now_ms(). Held via shared_ptr so the test seam
     // can swap it without racing concurrent readers (atomic<shared_ptr>).
+    // libc++ (AppleClang, LLVM <= 19) lacks std::atomic<std::shared_ptr>, so
+    // fall back to the std::atomic_load/store shared_ptr overloads there.
     using ClockFn = std::function<Millis()>;
+#if defined(__cpp_lib_atomic_shared_ptr)
     std::atomic<std::shared_ptr<const ClockFn>> clock_;
+#else
+    std::shared_ptr<const ClockFn> clock_;
+#endif
     std::atomic<Millis> last_send_time_ms_{0};
     std::atomic<Millis> last_recv_time_ms_{0};
     std::atomic<Millis> logon_sent_time_ms_{0};
