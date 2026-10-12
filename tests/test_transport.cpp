@@ -456,8 +456,11 @@ TEST(TcpTransportErrors, PeerResetSurfacesOnError) {
 // ---------------------------------------------------------------------------
 TEST(TcpTransportDns, UnresolvableHostFailsStartOnCallerThread) {
     TcpTransportConfig tc;
-    tc.host = "invalid fix host name"; // syntactically invalid: EAI_NONAME with
-                                       // no network round-trip → deterministic
+    // Syntactically invalid: a 64-character label exceeds the RFC 1035 limit
+    // of 63, so every resolver rejects it locally (EAI_NONAME, no network
+    // round-trip). A name that is merely odd (e.g. containing spaces) is
+    // still sent to mDNSResponder on macOS and times out after ~5 s.
+    tc.host = "invalid-fix-host-" + std::string(64, 'a') + ".invalid";
     tc.port = 12345;
     tc.initiator = true;
 
