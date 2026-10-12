@@ -23,6 +23,11 @@
 #include <unistd.h>
 #endif
 
+// Global-scope forward declaration: without it, `struct addrinfo *` inside
+// namespace fix would declare a distinct fix::addrinfo on platforms where
+// <netdb.h> is not included above (macOS, Windows).
+struct addrinfo;
+
 namespace fix {
 
 class TcpTransport : public ITransport {
@@ -125,7 +130,7 @@ private:
     // thread (resolve_target), read by the IO thread for every connect
     // attempt, freed only when the previous IO thread has been joined (start)
     // or in the destructor (stop). Reconnects never call getaddrinfo again.
-    struct addrinfo *resolved_ = nullptr;
+    ::addrinfo *resolved_ = nullptr;
 
     // -- Threads --------------------------------------------------------------
     void run_acceptor();

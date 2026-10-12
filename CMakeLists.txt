@@ -29,6 +29,7 @@ option(FIX_ENABLE_TSAN   "Enable ThreadSanitizer"    OFF)
 option(FIX_ENABLE_UBSAN  "Enable UBSanitizer"        OFF)
 option(FIX_ENABLE_LTO    "Enable Link-Time Optimisation" OFF)
 option(FIX_NO_EXCEPTIONS "Build without exceptions (-fno-exceptions)" OFF)
+option(FIX_BUILD_BENCHMARKS "Build microbenchmarks (Google Benchmark)" OFF)
 
 # =============================================================================
 # Compiler flags
@@ -66,6 +67,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         endif()
     endif()
 elseif(MSVC)
+    # <windows.h> defines min/max macros that break std::numeric_limits<T>::max().
+    target_compile_definitions(fix_compile_options INTERFACE NOMINMAX)
     target_compile_options(fix_compile_options INTERFACE
         /W4 /WX-
         $<$<CONFIG:Release>:/O2 /DNDEBUG>
@@ -185,10 +188,35 @@ if(FIX_BUILD_TESTS)
         PRIVATE fixengine GTest::gtest GTest::gtest_main
     )
 
+
     include(GoogleTest)
     gtest_discover_tests(fix_tests)
 
     add_test(NAME fix_unit_tests COMMAND fix_tests)
+endif()
+
+# =============================================================================
+# Benchmarks
+# =============================================================================
+if(FIX_BUILD_BENCHMARKS)
+    find_package(benchmark QUIET)
+    if(NOT benchmark_FOUND)
+        include(FetchContent)
+        FetchContent_Declare(
+            googlebenchmark
+            GIT_REPOSITORY https://github.com/google/benchmark.git
+            GIT_TAG        v1.9.1
+            GIT_SHALLOW    TRUE
+        )
+        set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+        set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+        set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+        set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(googlebenchmark)
+    endif()
+
+    add_executable(fix_bench benchmarks/bench_main.cpp)
+    target_link_libraries(fix_bench PRIVATE fixengine benchmark::benchmark)
 endif()
 
 # =============================================================================
@@ -231,6 +259,7 @@ if(CLANG_FORMAT_EXE)
         "${PROJECT_SOURCE_DIR}/src/*.cpp"
         "${PROJECT_SOURCE_DIR}/tests/*.cpp"
         "${PROJECT_SOURCE_DIR}/apps/*.cpp"
+        "${PROJECT_SOURCE_DIR}/benchmarks/*.cpp"
     )
     add_custom_target(
         format
@@ -255,6 +284,7 @@ message(STATUS "  Build type:  ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard:${CMAKE_CXX_STANDARD}")
 message(STATUS "  Tests:       ${FIX_BUILD_TESTS}")
 message(STATUS "  Apps:        ${FIX_BUILD_APPS}")
+message(STATUS "  Benchmarks:  ${FIX_BUILD_BENCHMARKS}")
 message(STATUS "  Shared lib:  ${FIX_BUILD_SHARED}")
 message(STATUS "  ASAN:        ${FIX_ENABLE_ASAN}")
 message(STATUS "  TSAN:        ${FIX_ENABLE_TSAN}")

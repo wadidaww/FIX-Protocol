@@ -163,6 +163,17 @@ std::filesystem::path make_temp_dir(const char *tag) {
     return dir;
 }
 
+// Removes a test directory on scope exit. Declare it BEFORE the FileAuditLog
+// so the log (and its open file handle) is destroyed first: Windows refuses
+// to delete a file that is still open.
+struct DirCleanup {
+    std::filesystem::path dir;
+    ~DirCleanup() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -286,6 +297,7 @@ TEST(AuditSessionTest, NullAuditLogIsSafeAndNoOp) {
 // ---------------------------------------------------------------------------
 TEST(AuditFileLogTest, WritesSessionExchangeToFile) {
     const auto dir = make_temp_dir("file");
+    DirCleanup cleanup{dir};
 
     std::vector<std::string> sent;
     SessionCallbacks cbs;
@@ -319,12 +331,11 @@ TEST(AuditFileLogTest, WritesSessionExchangeToFile) {
     // Raw frames with SOH replaced by '|' for readability.
     EXPECT_NE(content.find("35=A|"), std::string::npos);
     EXPECT_NE(content.find("35=0|"), std::string::npos);
-
-    std::filesystem::remove_all(dir);
 }
 
 TEST(AuditFileLogTest, RotateStampsNewFileAndIsolatesEntries) {
     const auto dir = make_temp_dir("rotate");
+    DirCleanup cleanup{dir};
 
     FileAuditLog::Config cfg;
     cfg.dir = dir;
@@ -383,8 +394,6 @@ TEST(AuditFileLogTest, RotateStampsNewFileAndIsolatesEntries) {
         if (read_file(p).find("THIRD") != std::string::npos)
             ++third_hits;
     EXPECT_EQ(third_hits, 1u);
-
-    std::filesystem::remove_all(dir);
 }
 
 TEST(AuditFileLogTest, RetentionDeletesStaleLogsAtStartAndRotation) {
@@ -456,6 +465,7 @@ TEST(AuditFileLogTest, RetentionDeletesStaleLogsAtStartAndRotation) {
 
 TEST(AuditFileLogTest, BoundedQueueDropsUnderFloodAreCounted) {
     const auto dir = make_temp_dir("flood");
+    DirCleanup cleanup{dir};
 
     FileAuditLog::Config cfg;
     cfg.dir = dir;
@@ -491,6 +501,4 @@ TEST(AuditFileLogTest, BoundedQueueDropsUnderFloodAreCounted) {
     }
     EXPECT_EQ(lines, static_cast<std::uint64_t>(kTotal) - dropped);
     EXPECT_LT(lines, static_cast<std::uint64_t>(kTotal));
-
-    std::filesystem::remove_all(dir);
 }

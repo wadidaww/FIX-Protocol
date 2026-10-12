@@ -688,15 +688,17 @@ TEST_F(FileStoreTest, LegacyNamedFilesMigrateOnOpen) {
     const auto legacy_out = tmpdir / "SENDER-TARGET.out.log";
     const auto legacy_in = tmpdir / "SENDER-TARGET.in.log";
     {
-        std::ofstream f(legacy_seq);
+        // Binary mode: the engine writes these files in binary, and text mode
+        // would add '\r' before each '\n' on Windows.
+        std::ofstream f(legacy_seq, std::ios::binary);
         f << "50\n70\n";
     }
     {
-        std::ofstream f(legacy_out, std::ios::app);
+        std::ofstream f(legacy_out, std::ios::app | std::ios::binary);
         f << "49|8=FIX.4.4|35=x|9=100|10=000|\n";
     }
     {
-        std::ofstream f(legacy_in, std::ios::app);
+        std::ofstream f(legacy_in, std::ios::app | std::ios::binary);
         f << "1|8=FIX.4.4|35=0|10=111|\n";
     }
 
