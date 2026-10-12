@@ -52,6 +52,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #ifndef _WIN32
@@ -71,6 +72,55 @@ using namespace fix;
 using namespace std::chrono_literals;
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// std::jthread / std::stop_token, or a minimal stand-in where the standard
+// library lacks them (libc++ before LLVM 18 / AppleClang 15 keeps them behind
+// -fexperimental-library). Only the subset these tests use is provided.
+// ---------------------------------------------------------------------------
+#if defined(__cpp_lib_jthread)
+using JThread = std::jthread;
+using StopToken = std::stop_token;
+#else
+class StopToken {
+public:
+    explicit StopToken(std::shared_ptr<const std::atomic<bool>> flag)
+        : flag_(std::move(flag)) {}
+    [[nodiscard]] bool stop_requested() const noexcept {
+        return flag_->load(std::memory_order_acquire);
+    }
+
+private:
+    std::shared_ptr<const std::atomic<bool>> flag_;
+};
+
+class JThread {
+public:
+    template <class F>
+    explicit JThread(F &&f) {
+        if constexpr (std::is_invocable_v<F, StopToken>)
+            thread_ = std::thread(std::forward<F>(f), StopToken{stop_});
+        else
+            thread_ = std::thread(std::forward<F>(f));
+    }
+    JThread(JThread &&) noexcept = default;
+    JThread &operator=(JThread &&) = delete;
+    ~JThread() {
+        if (thread_.joinable()) {
+            request_stop();
+            thread_.join();
+        }
+    }
+
+    void request_stop() noexcept { stop_->store(true, std::memory_order_release); }
+    void join() { thread_.join(); }
+    [[nodiscard]] bool joinable() const noexcept { return thread_.joinable(); }
+
+private:
+    std::shared_ptr<std::atomic<bool>> stop_ = std::make_shared<std::atomic<bool>>(false);
+    std::thread thread_;
+};
+#endif
 
 // ---------------------------------------------------------------------------
 // Ports / config (same patterns as tests/test_e2e.cpp)
@@ -538,7 +588,7 @@ TEST(StressEngine, ConcurrentSendTrafficAndSessionChurn) {
     // -- Loaders: steady app traffic on pair 1 --------------------------------
     std::atomic<bool> stop_load{false};
     const auto load_start = std::chrono::steady_clock::now();
-    std::vector<std::jthread> loader_threads;
+    std::vector<JThread> loader_threads;
     loader_threads.reserve(loaders.size());
     for (std::size_t t = 0; t < loaders.size(); ++t) {
         loader_threads.emplace_back([&, t] {
@@ -558,7 +608,7 @@ TEST(StressEngine, ConcurrentSendTrafficAndSessionChurn) {
 
     // -- Churn sender: hammers pair-2's initiator through outages -------------
     SenderStats churn_stats; // written by this thread only, read after join
-    std::jthread churn_sender([&] {
+    JThread churn_sender([&] {
         int i = 0;
         while (!stop_load.load(std::memory_order_acquire)) {
             auto r = init2->send(make_nos("C-" + std::to_string(i++)));
@@ -573,7 +623,7 @@ TEST(StressEngine, ConcurrentSendTrafficAndSessionChurn) {
 
     // -- Control: remove/re-add pair-2's acceptor + registry churn ------------
     constexpr int kControlCycles = 4;
-    std::jthread control([&] {
+    JThread control([&] {
         for (int k = 0; k < kControlCycles; ++k) {
             EXPECT_TRUE(engine.remove_session(acc2_id)) << "cycle " << k << ": remove failed";
             EXPECT_TRUE(wait_until([&] { return engine.get_session(acc2_id) == nullptr; }, 2000ms))
@@ -765,7 +815,7 @@ TEST(StressEngine, RawHandshakeRacesAcceptorChurn) {
 
     // -- Loop A: raw client cycles (concurrent with loop B's churn) -----------
     constexpr int kRawCycles = 4;
-    std::jthread loop_a([&] {
+    JThread loop_a([&] {
         for (int i = 2; i <= 1 + kRawCycles && !a_stop.load(std::memory_order_acquire); ++i) {
             ++raw_attempts;
             const int fd = raw_connect(port, 1500ms);
@@ -788,7 +838,7 @@ TEST(StressEngine, RawHandshakeRacesAcceptorChurn) {
     constexpr int kChurnCycles = 3;
     std::atomic<std::uint64_t> b_cycles{0};
     std::atomic<std::uint64_t> b_gates{0};
-    std::jthread loop_b([&] {
+    JThread loop_b([&] {
         for (int k = 0; k < kChurnCycles; ++k) {
             EXPECT_TRUE(engine.remove_session(acc_id)) << "cycle " << k;
             EXPECT_TRUE(wait_until([&] { return engine.get_session(acc_id) == nullptr; }, 2000ms))
@@ -886,7 +936,7 @@ TEST(StressSession, ConcurrentSendClaimsContiguousUniqueSequences) {
     std::array<Stats, 4> st{};
     constexpr int kPerThread = 500;
     {
-        std::vector<std::jthread> threads;
+        std::vector<JThread> threads;
         threads.reserve(st.size());
         for (std::size_t t = 0; t < st.size(); ++t) {
             threads.emplace_back([&, t] {
@@ -1019,8 +1069,8 @@ TEST(StressAudit, FlushRotateRaceUnderConcurrentSessionTraffic) {
     };
 
     {
-        std::jthread t1([&] { drive(s1, "PEER1", "AUD1", &d1); });
-        std::jthread t2([&] { drive(s2, "PEER2", "AUD2", &d2); });
+        JThread t1([&] { drive(s1, "PEER1", "AUD1", &d1); });
+        JThread t2([&] { drive(s2, "PEER2", "AUD2", &d2); });
         t1.join();
         t2.join();
     }
@@ -1118,7 +1168,7 @@ TEST(StressSession, TimerIoAndDisconnectRaceEndCoherent) {
     ASSERT_TRUE(sess.send(make_nos("WARM")).has_value());
 
     // -- Timer thread: advance the virtual clock, drive on_timer -------------
-    std::jthread timer_th([&](std::stop_token st) {
+    JThread timer_th([&](StopToken st) {
         std::uint64_t n = 0;
         while (!st.stop_requested()) {
             fake.fetch_add(1, std::memory_order_relaxed);
@@ -1129,7 +1179,7 @@ TEST(StressSession, TimerIoAndDisconnectRaceEndCoherent) {
     });
 
     // -- IO thread: in-sequence traffic, gap injections, TestRequests --------
-    std::jthread io_th([&](std::stop_token st) {
+    JThread io_th([&](StopToken st) {
         SeqNum next_in = 2; // handshake consumed peer seq 1
         std::uint64_t i = 0;
         while (!st.stop_requested()) {
@@ -1169,7 +1219,7 @@ TEST(StressSession, TimerIoAndDisconnectRaceEndCoherent) {
         std::uint64_t ok = 0;
         std::uint64_t err = 0;
     } user;
-    std::jthread user_th([&](std::stop_token st) {
+    JThread user_th([&](StopToken st) {
         std::uint64_t i = 0;
         while (!st.stop_requested()) {
             auto r = sess.send(make_nos("U-" + std::to_string(i++)));

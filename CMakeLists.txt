@@ -188,20 +188,6 @@ if(FIX_BUILD_TESTS)
         PRIVATE fixengine GTest::gtest GTest::gtest_main
     )
 
-    # The stress tests use std::jthread, which libc++ (AppleClang, LLVM <= 19)
-    # only provides behind -fexperimental-library.
-    include(CheckCXXSourceCompiles)
-    set(_fix_jthread_src "#include <thread>\nint main() { std::jthread t([] {}); }")
-    check_cxx_source_compiles("${_fix_jthread_src}" FIX_HAVE_JTHREAD)
-    if(NOT FIX_HAVE_JTHREAD)
-        set(CMAKE_REQUIRED_FLAGS "-fexperimental-library")
-        check_cxx_source_compiles("${_fix_jthread_src}" FIX_HAVE_JTHREAD_EXPERIMENTAL)
-        unset(CMAKE_REQUIRED_FLAGS)
-        if(FIX_HAVE_JTHREAD_EXPERIMENTAL)
-            target_compile_options(fix_tests PRIVATE -fexperimental-library)
-            target_link_options(fix_tests PRIVATE -fexperimental-library)
-        endif()
-    endif()
 
     include(GoogleTest)
     gtest_discover_tests(fix_tests)
